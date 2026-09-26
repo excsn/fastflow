@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_capture"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fastflow_core",
  "fastflow_daemon",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
  "serde",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fibre",
  "libc",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_render"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "fast_image_resize",
  "fastflow_core",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "fastflow_ui_macos"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "block2 0.6.2",
  "chrono",

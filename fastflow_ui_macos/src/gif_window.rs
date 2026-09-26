@@ -816,6 +816,14 @@ impl GifWindow {
     self.window.makeKeyAndOrderFront(None);
   }
 
+  /// Picks `id` in the recording list, when it is there.
+  pub fn select(&mut self, id: &str) {
+    if let Some(i) = self.ids.iter().position(|r| r == id) {
+      self.recordings.selectItemAtIndex(i as isize);
+      self.choice = None;
+    }
+  }
+
   pub fn is_visible(&self) -> bool {
     self.window.isVisible()
   }

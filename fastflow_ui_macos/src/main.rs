@@ -5,9 +5,11 @@ mod notify;
 mod overlay;
 mod recorder;
 mod recovery;
+mod render_panel;
 mod settings;
 mod settings_window;
 mod setup;
+mod tray_art;
 
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -28,8 +30,8 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::MainThreadMarker;
 use recorder::Recorder;
 use setup::SetupWindow;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -124,9 +126,15 @@ struct PermissionRow {
 
 struct Tray {
   icon: TrayIcon,
+  glyphs: tray_art::Glyphs,
+  shown: std::cell::Cell<tray_art::State>,
   record: MenuItem,
   render_state: MenuItem,
-  reveal: MenuItem,
+  last: Submenu,
+  last_folder: MenuItem,
+  last_render: MenuItem,
+  last_raw: MenuItem,
+  last_gif: MenuItem,
   make_gif: MenuItem,
   settings: MenuItem,
   rows: Vec<PermissionRow>,
@@ -145,6 +153,9 @@ struct App {
   overlay: Option<overlay::Overlay>,
   gif: Option<gif_window::GifWindow>,
   settings: Option<settings_window::SettingsWindow>,
+  panel: Option<render_panel::RenderPanel>,
+  /// The newest recording that is not still recording.
+  last_id: Option<String>,
 }
 
 impl App {
@@ -161,7 +172,14 @@ impl App {
       .collect();
     let record = MenuItem::new("Start Recording  ⌃⌥⌘R", true, None);
     let render_state = MenuItem::new("No renders yet", false, None);
-    let reveal = MenuItem::new("Show Last Render", false, None);
+    let last = Submenu::new("Last Recording", false);
+    let last_folder = MenuItem::new("Open Folder", true, None);
+    let last_render = MenuItem::new("Play Render", false, None);
+    let last_raw = MenuItem::new("Play Raw", true, None);
+    let last_gif = MenuItem::new("Make GIF…", true, None);
+    for item in [&last_folder, &last_render, &last_raw, &last_gif] {
+      last.append(item).unwrap();
+    }
     let make_gif = MenuItem::new("Make GIF…", true, None);
     let settings = MenuItem::new("Settings…", true, None);
     let quit = MenuItem::new("Quit", true, None);
@@ -170,7 +188,7 @@ impl App {
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&record).unwrap();
     menu.append(&render_state).unwrap();
-    menu.append(&reveal).unwrap();
+    menu.append(&last).unwrap();
     menu.append(&make_gif).unwrap();
     menu.append(&settings).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
@@ -180,9 +198,10 @@ impl App {
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&quit).unwrap();
 
+    let glyphs = tray_art::Glyphs::load();
     let icon = TrayIconBuilder::new()
       .with_menu(Box::new(menu))
-      .with_icon(tray_glyph(false))
+      .with_icon(glyphs.icon(tray_art::State::Idle))
       .with_icon_as_template(true)
       .with_tooltip("fastflow")
       .build()
@@ -190,9 +209,15 @@ impl App {
 
     self.tray = Some(Tray {
       icon,
+      glyphs,
+      shown: std::cell::Cell::new(tray_art::State::Idle),
       record,
       render_state,
-      reveal,
+      last,
+      last_folder,
+      last_render,
+      last_raw,
+      last_gif,
       make_gif,
       settings,
       rows,
@@ -491,18 +516,68 @@ impl App {
       (None, None) => "No renders yet".into(),
     };
     tray.render_state.set_text(text);
-    tray
-      .reveal
-      .set_enabled(matches!(&s.last, Some(Finished { result: Ok(_), .. })));
+    self.refresh_icon();
+
+    tray.last.set_enabled(self.last_id.is_some());
+    let Some(id) = &self.last_id else { return };
+    let dir = paths::recordings().join(id);
+    let (label, ready) = match &s.rendering {
+      Some(r) if r.id == *id => (
+        format!("Play Render (rendering {:.0}%)", r.progress * 100.0),
+        false,
+      ),
+      _ if s.queued.contains(id) => ("Play Render (queued)".into(), false),
+      _ if dir.join("render.mp4").is_file() => ("Play Render".into(), true),
+      _ => ("Play Render (not rendered)".into(), false),
+    };
+    tray.last_render.set_text(label);
+    tray.last_render.set_enabled(ready);
+    tray.last_raw.set_enabled(first_raw(&dir).is_some());
   }
 
-  fn reveal_last_render(&self) {
-    let Some(q) = &self.queue else { return };
-    if let Some(Finished {
-      result: Ok(path), ..
-    }) = q.status().last
-    {
-      let _ = Command::new("open").args(["-R", &path]).status();
+  /// The menu bar icon: filled while recording, filling from the left while rendering.
+  fn refresh_icon(&self) {
+    let Some(tray) = &self.tray else { return };
+    let rendering = self.queue.as_ref().and_then(|q| q.status().rendering);
+    let state = match (self.recorder.is_some(), rendering) {
+      (true, _) => tray_art::State::Recording,
+      (false, Some(r)) => tray_art::State::rendering(r.progress),
+      (false, None) => tray_art::State::Idle,
+    };
+    if tray.shown.replace(state) != state {
+      let _ = tray.icon.set_icon(Some(tray.glyphs.icon(state)));
+      tray.icon.set_icon_as_template(true);
+    }
+  }
+
+  fn refresh_last_recording(&mut self) {
+    self.last_id = paths::list_recordings(10)
+      .into_iter()
+      .find(|r| !r.recording)
+      .map(|r| r.id);
+  }
+
+  fn open_last(&mut self, what: LastAction) {
+    let Some(id) = self.last_id.clone() else {
+      return;
+    };
+    let dir = paths::recordings().join(&id);
+    let target = match what {
+      LastAction::Folder => Some(dir),
+      LastAction::Render => Some(dir.join("render.mp4")),
+      LastAction::Raw => first_raw(&dir),
+      LastAction::Gif => {
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let gif = self
+          .gif
+          .get_or_insert_with(|| gif_window::GifWindow::new(mtm));
+        gif.show(mtm);
+        gif.select(&id);
+        None
+      }
+    };
+    if let Some(t) = target {
+      let _ = Command::new("open").arg(&t).status();
     }
   }
 
@@ -514,8 +589,7 @@ impl App {
     } else {
       "Start Recording  ⌃⌥⌘R"
     });
-    let _ = tray.icon.set_icon(Some(tray_glyph(recording)));
-    tray.icon.set_icon_as_template(true);
+    self.refresh_icon();
   }
 
   fn tick_recording(&mut self) {
@@ -583,8 +657,17 @@ impl App {
       self.toggle_recording();
       return;
     }
-    if event.id == *tray.reveal.id() {
-      self.reveal_last_render();
+    let last = [
+      (tray.last_folder.id(), LastAction::Folder),
+      (tray.last_render.id(), LastAction::Render),
+      (tray.last_raw.id(), LastAction::Raw),
+      (tray.last_gif.id(), LastAction::Gif),
+    ]
+    .into_iter()
+    .find(|(id, _)| event.id == **id)
+    .map(|(_, a)| a);
+    if let Some(action) = last {
+      self.open_last(action);
       return;
     }
     if event.id == *tray.make_gif.id() {
@@ -616,7 +699,15 @@ impl ApplicationHandler<UserEvent> for App {
       StartCause::Init => self.on_launch(),
       StartCause::ResumeTimeReached { .. } => {
         self.tick_recording();
+        self.refresh_last_recording();
         self.show_render_state();
+        if let Some(q) = &self.queue {
+          let mtm = MainThreadMarker::new().expect("main thread");
+          self
+            .panel
+            .get_or_insert_with(|| render_panel::RenderPanel::new(mtm))
+            .update(&q.status(), mtm);
+        }
         if let Some(g) = &mut self.gif {
           let mtm = MainThreadMarker::new().expect("main thread");
           g.tick(mtm);
@@ -637,7 +728,8 @@ impl ApplicationHandler<UserEvent> for App {
     let rendering = self
       .queue
       .as_ref()
-      .is_some_and(|q| q.status().rendering.is_some());
+      .is_some_and(|q| q.status().rendering.is_some())
+      || self.panel.as_ref().is_some_and(|p| p.is_active());
     let gif_open = self.gif.as_ref().is_some_and(|g| g.is_visible())
       || self.settings.as_ref().is_some_and(|s| s.is_visible());
     let period = if self.overlay.is_some() {
@@ -670,20 +762,20 @@ impl ApplicationHandler<UserEvent> for App {
   fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
 }
 
-/// Generated by `scripts/icons.sh`.
-fn tray_glyph(recording: bool) -> Icon {
-  let bytes: &[u8] = if recording {
-    include_bytes!("../bundle/tray_recording.png")
-  } else {
-    include_bytes!("../bundle/tray.png")
-  };
-  let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
-    .read_info()
-    .expect("tray png");
-  let mut rgba = vec![0; reader.output_buffer_size().expect("tray png size")];
-  let info = reader.next_frame(&mut rgba).expect("tray png frame");
-  rgba.truncate(info.buffer_size());
-  Icon::from_rgba(rgba, info.width, info.height).expect("icon")
+#[derive(Clone, Copy)]
+enum LastAction {
+  Folder,
+  Render,
+  Raw,
+  Gif,
+}
+
+/// The first segment's raw capture, which is the one a player can open on its own.
+fn first_raw(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+  let text = std::fs::read_to_string(dir.join("meta.json")).ok()?;
+  let meta: fastflow_core::recording::Meta = serde_json::from_str(&text).ok()?;
+  let path = dir.join(&meta.segments.first()?.file);
+  path.is_file().then_some(path)
 }
 
 fn main() {
@@ -710,6 +802,8 @@ fn main() {
     overlay: None,
     gif: None,
     settings: None,
+    panel: None,
+    last_id: None,
   };
   event_loop.run_app(&mut app).expect("event loop");
 }
