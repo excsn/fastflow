@@ -17,6 +17,9 @@ const USAGE: &str = "usage:
   fastflow unpin <id>
   fastflow render <dir> [-o <out.mp4>] [--boxes]
                                    render a recording directory here, without the app
+  fastflow diagram <id|dir> [cols] print what pacing and the camera decided
+  fastflow proxy <id|dir>          make the small proxy.mp4 that previews read
+  fastflow preview <id|dir>        render preview.mp4 from the proxy, for tuning config.toml
 
   --boxes   render the whole frame with the sampled windows, cursor, chosen subject
             and camera rect drawn on it, to check the camera's inputs";
@@ -30,6 +33,22 @@ fn main() -> ExitCode {
         (Some("list"), rest) => parse_limit(rest)
             .and_then(|limit| ask(Request::List { limit }))
             .map(print_list),
+        (Some("diagram"), [target]) => diagram(target, 100),
+        (Some("diagram"), [target, cols]) => cols
+            .parse()
+            .map_err(|_| USAGE.to_string())
+            .and_then(|c| diagram(target, c)),
+        (Some("proxy"), [target]) => resolve(target)
+            .and_then(|dir| job::make_proxy(&dir))
+            .map(|p| println!("wrote {}", p.display())),
+        (Some("preview"), [target]) => resolve(target).and_then(|dir| {
+            render(&RenderJob {
+                out: dir.join("preview.mp4"),
+                dir,
+                boxes: false,
+                preview: true,
+            })
+        }),
         (Some("pin"), [id]) => set_pinned(id, true),
         (Some("unpin"), [id]) => set_pinned(id, false),
         (Some("render"), [target]) if !std::path::Path::new(target).is_dir() => {
@@ -45,6 +64,38 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A directory path as given, otherwise a recording id under the recordings folder.
+fn resolve(target: &str) -> Result<PathBuf, String> {
+    let as_path = PathBuf::from(target);
+    let dir = if as_path.is_dir() {
+        as_path
+    } else {
+        paths::recordings().join(target)
+    };
+    if dir.join("meta.json").is_file() {
+        Ok(dir)
+    } else {
+        Err(format!("no recording at {target}"))
+    }
+}
+
+fn diagram(target: &str, cols: usize) -> Result<(), String> {
+    let dir = resolve(target)?;
+    let plan = job::plan(&dir, &mut |_| {})?;
+    let text = fastflow_core::diagram::render(
+        &fastflow_core::diagram::Inputs {
+            timeline: &plan.timeline,
+            camera: &plan.track,
+            events: &plan.events,
+            markers: &plan.markers,
+            duration: plan.duration,
+        },
+        cols,
+    );
+    println!("{text}");
+    Ok(())
 }
 
 fn set_pinned(id: &str, pinned: bool) -> Result<(), String> {
@@ -135,7 +186,12 @@ fn parse_render(args: &[String]) -> Result<RenderJob, String> {
     }
     let dir: PathBuf = dir.ok_or(USAGE)?;
     let out = out.unwrap_or_else(|| dir.join(if boxes { "boxes.mp4" } else { "render.mp4" }));
-    Ok(RenderJob { dir, out, boxes })
+    Ok(RenderJob {
+        dir,
+        out,
+        boxes,
+        preview: false,
+    })
 }
 
 fn render(job: &RenderJob) -> Result<(), String> {

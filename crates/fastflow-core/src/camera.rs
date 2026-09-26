@@ -323,6 +323,20 @@ impl CameraTrack {
         self.moves.len()
     }
 
+    /// Output start and duration of each move.
+    pub fn moves(&self) -> Vec<(f64, f64)> {
+        self.moves.iter().map(|m| (m.start, m.duration)).collect()
+    }
+
+    /// Output time each window became the focus, starting with the first subject at 0.
+    pub fn focus_changes(&self) -> Vec<(f64, u32)> {
+        self.initial_focus
+            .map(|id| (0.0, id))
+            .into_iter()
+            .chain(self.focus.iter().map(|c| (c.start, c.to)))
+            .collect()
+    }
+
     /// Focused windows and how focused each is, 0 to 1. Two entries mid-crossfade, none before
     /// any window was chosen.
     pub fn focus_at(&self, out_t: f64) -> Vec<(u32, f64)> {

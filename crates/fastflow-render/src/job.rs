@@ -8,7 +8,7 @@ use fastflow_core::camera::{self, CameraTrack, Geometry};
 use fastflow_core::config::Config;
 use fastflow_core::geom::Rect;
 use fastflow_core::markers::Markers;
-use fastflow_core::recording::{InputEvent, Meta, WindowSample};
+use fastflow_core::recording::{InputEvent, Meta, SegmentInfo, WindowSample};
 use fastflow_core::timeline::{SpanKind, Timeline};
 
 use crate::compositor::{self, Framing, RenderSettings};
@@ -22,6 +22,48 @@ pub struct RenderJob {
     pub out: PathBuf,
     /// Draw the camera's inputs over the whole frame instead of cropping.
     pub boxes: bool,
+    /// Read `proxy.mp4` and write a half-size, 30fps preview. The tracks are planned exactly as
+    /// for the final render, so the preview shows the same pacing and framing.
+    pub preview: bool,
+}
+
+pub const PROXY_FILE: &str = "proxy.mp4";
+pub const PROXY_WIDTH: u32 = 960;
+const PREVIEW_FPS: u32 = 30;
+
+/// Everything the tracks decided for a recording, before any pixels are touched.
+pub struct Plan {
+    pub cfg: Config,
+    pub segment: SegmentInfo,
+    pub duration: f64,
+    pub events: Vec<f64>,
+    pub markers: Markers,
+    pub timeline: Timeline,
+    pub geo: Geometry,
+    pub samples: Vec<WindowSample>,
+    pub track: CameraTrack,
+}
+
+/// The proxy's pixel size for a surface: `PROXY_WIDTH` wide, height rounded to even.
+pub fn proxy_size(surface_px: [u32; 2]) -> (u32, u32) {
+    let h =
+        (PROXY_WIDTH as f64 * surface_px[1] as f64 / surface_px[0] as f64 / 2.0).round() as u32 * 2;
+    (PROXY_WIDTH, h.max(2))
+}
+
+/// Writes `proxy.mp4` next to the raw segment.
+pub fn make_proxy(dir: &Path) -> Result<PathBuf, String> {
+    let meta: Meta = read_json(&dir.join("meta.json"))?;
+    let segment = meta.segments.first().ok_or("meta.json lists no segments")?;
+    let out = dir.join(PROXY_FILE);
+    crate::ffmpeg::transcode_proxy(
+        &dir.join(&segment.file),
+        &out,
+        proxy_size(segment.surface_px),
+        PREVIEW_FPS,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -121,14 +163,8 @@ fn draw_boxes(
     overlay::dot(frame, c.x, c.y, 6, YELLOW);
 }
 
-/// Renders `job.dir` to `job.out`. `log` receives the summary lines, `progress` frames done and
-/// the total.
-pub fn run(
-    job: &RenderJob,
-    log: &mut dyn FnMut(String),
-    progress: &mut dyn FnMut(u64, u64),
-) -> Result<Report, String> {
-    let (dir, out) = (job.dir.as_path(), job.out.as_path());
+/// Reads the recording and builds its timeline and camera track.
+pub fn plan(dir: &Path, log: &mut dyn FnMut(String)) -> Result<Plan, String> {
     let meta: Meta = read_json(&dir.join("meta.json"))?;
     let cfg = read_config(dir)?;
     let input = read_input(&dir.join("input.jsonl"))?;
@@ -178,9 +214,60 @@ pub fn run(
         track.move_count(),
         samples.len()
     ));
+    Ok(Plan {
+        cfg,
+        segment,
+        duration,
+        events,
+        markers,
+        timeline,
+        geo,
+        samples,
+        track,
+    })
+}
 
-    let size = (cfg.output.size[0], cfg.output.size[1]);
-    let fps = cfg.output.fps;
+/// Renders `job.dir` to `job.out`. `log` receives the summary lines, `progress` frames done and
+/// the total.
+pub fn run(
+    job: &RenderJob,
+    log: &mut dyn FnMut(String),
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<Report, String> {
+    let (dir, out) = (job.dir.as_path(), job.out.as_path());
+    let Plan {
+        cfg,
+        segment,
+        markers,
+        timeline,
+        geo,
+        samples,
+        track,
+        ..
+    } = plan(dir, log)?;
+
+    let (source, segment, size, fps) = if job.preview {
+        let proxy = dir.join(PROXY_FILE);
+        if !proxy.is_file() {
+            return Err(format!("{} has no {PROXY_FILE} yet", dir.display()));
+        }
+        let (w, h) = proxy_size(segment.surface_px);
+        let decoded = SegmentInfo {
+            surface_px: [w, h],
+            ..segment
+        };
+        let size = (cfg.output.size[0] / 2, cfg.output.size[1] / 2);
+        (proxy, decoded, size, PREVIEW_FPS)
+    } else {
+        let file = dir.join(&segment.file);
+        (
+            file,
+            segment,
+            (cfg.output.size[0], cfg.output.size[1]),
+            cfg.output.fps,
+        )
+    };
+    let px_scale = size.0 as f64 / cfg.output.size[0] as f64;
     let cropping = cfg.camera.enabled && !job.boxes;
     let decode = if cropping {
         Decode::Native
@@ -188,8 +275,8 @@ pub fn run(
         Decode::Fit(size.0, size.1)
     };
     let letterbox = Letterbox::new((segment.surface_px[0], segment.surface_px[1]), size);
-    let mut src = FfmpegSource::open(&dir.join(&segment.file), segment, decode, fps as f64)
-        .map_err(|e| e.to_string())?;
+    let mut src =
+        FfmpegSource::open(&source, segment, decode, fps as f64).map_err(|e| e.to_string())?;
     let chapters_file = out.with_extension("chapters.txt");
     let chapters = if markers.chapters.is_empty() {
         None
@@ -227,9 +314,9 @@ pub fn run(
         }
     };
     let focus_settings = FocusSettings {
-        blur: cfg.focus.blur,
+        blur: cfg.focus.blur * px_scale,
         dim: cfg.focus.dim,
-        feather: cfg.focus.feather,
+        feather: cfg.focus.feather * px_scale,
     };
     let corner = cfg.focus.corner_radius / geo.surface_pt.0;
     let mut focus = FocusBlur::default();

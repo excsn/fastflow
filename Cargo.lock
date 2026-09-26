@@ -515,6 +515,7 @@ dependencies = [
 name = "fastflow-cli"
 version = "0.1.0"
 dependencies = [
+ "fastflow-core",
  "fastflow-daemon",
  "fastflow-render",
 ]

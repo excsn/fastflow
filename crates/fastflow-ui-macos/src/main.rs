@@ -256,13 +256,18 @@ impl App {
             log(format!("render {id} started"));
             let report = job::run(
                 &RenderJob {
-                    dir,
+                    dir: dir.clone(),
                     out,
                     boxes: false,
+                    preview: false,
                 },
                 &mut |line| log(format!("render {id}: {line}")),
                 &mut |done, total| progress(done as f64 / total.max(1) as f64),
             )?;
+            match job::make_proxy(&dir) {
+                Ok(p) => log(format!("proxy {id}: {}", p.display())),
+                Err(e) => log(format!("proxy {id}: {e}")),
+            }
             Ok(report.out.to_string_lossy().into_owned())
         });
         let proxy = self.proxy.clone();

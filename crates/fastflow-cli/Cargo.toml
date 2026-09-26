@@ -9,5 +9,6 @@ name = "fastflow"
 path = "src/main.rs"
 
 [dependencies]
+fastflow-core.workspace = true
 fastflow-daemon.workspace = true
 fastflow-render.workspace = true

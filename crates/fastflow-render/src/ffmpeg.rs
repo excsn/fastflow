@@ -156,6 +156,33 @@ impl Drop for FfmpegSource {
     }
 }
 
+/// Scales a raw segment down for fast previews. Keyframes every second keep seeking cheap.
+pub fn transcode_proxy(src: &Path, out: &Path, (w, h): (u32, u32), fps: u32) -> Result<()> {
+    let status = Command::new(locate()?)
+        .args(["-v", "error", "-y", "-hwaccel", "videotoolbox", "-i"])
+        .arg(src)
+        .args(["-vf", &format!("scale={w}:{h},fps={fps}")])
+        .args([
+            "-c:v",
+            "h264_videotoolbox",
+            "-b:v",
+            "3M",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .args(["-force_key_frames", "expr:gte(t,n_forced*1)"])
+        .arg(out)
+        .stdin(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(RenderError::Encode(format!(
+            "proxy: ffmpeg exited with {status}"
+        )))
+    }
+}
+
 pub struct FfmpegSink {
     child: Child,
     stdin: Option<ChildStdin>,
