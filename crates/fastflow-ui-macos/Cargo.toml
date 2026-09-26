@@ -14,6 +14,7 @@ fastflow-capture.workspace = true
 fastflow-core.workspace = true
 fastflow-daemon.workspace = true
 fastflow-render.workspace = true
+global-hotkey.workspace = true
 fastflow-desktop.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true

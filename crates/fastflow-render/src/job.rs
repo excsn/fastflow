@@ -7,6 +7,7 @@ use std::time::Instant;
 use fastflow_core::camera::{self, CameraTrack, Geometry};
 use fastflow_core::config::Config;
 use fastflow_core::geom::Rect;
+use fastflow_core::markers::Markers;
 use fastflow_core::recording::{InputEvent, Meta, WindowSample};
 use fastflow_core::timeline::{SpanKind, Timeline};
 
@@ -45,13 +46,34 @@ fn read_config(dir: &Path) -> Result<Config, String> {
 }
 
 /// A truncated final line is what a killed recorder leaves behind, so it is skipped.
-fn read_input(path: &Path) -> Result<Vec<f64>, String> {
+fn read_input(path: &Path) -> Result<Vec<InputEvent>, String> {
     let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(text
         .lines()
         .filter_map(|l| serde_json::from_str::<InputEvent>(l).ok())
-        .map(|e| e.t as f64 / 1000.0)
         .collect())
+}
+
+/// An ffmetadata file with a chapter at the start and one at each Chapter marker.
+fn write_chapters(path: &Path, starts_ms: &[i64], end_ms: i64) -> Result<(), String> {
+    let mut text = String::from(";FFMETADATA1\n");
+    let mut starts: Vec<i64> = std::iter::once(0)
+        .chain(starts_ms.iter().copied())
+        .filter(|&s| s >= 0 && s < end_ms)
+        .collect();
+    starts.dedup();
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(end_ms);
+        let title = if i == 0 {
+            "Start".to_owned()
+        } else {
+            format!("Chapter {i}")
+        };
+        text.push_str(&format!(
+            "[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle={title}\n"
+        ));
+    }
+    fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn read_windows(path: &Path) -> Result<Vec<WindowSample>, String> {
@@ -109,7 +131,12 @@ pub fn run(
     let (dir, out) = (job.dir.as_path(), job.out.as_path());
     let meta: Meta = read_json(&dir.join("meta.json"))?;
     let cfg = read_config(dir)?;
-    let events = read_input(&dir.join("input.jsonl"))?;
+    let input = read_input(&dir.join("input.jsonl"))?;
+    let events: Vec<f64> = input
+        .iter()
+        .filter(|e| !e.kind.is_marker())
+        .map(|e| e.t as f64 / 1000.0)
+        .collect();
     let segment = meta
         .segments
         .first()
@@ -124,13 +151,24 @@ pub fn run(
         as f64
         / 1000.0;
 
-    let timeline = Timeline::build(&events, duration, &cfg.pacing);
+    let markers = Markers::from_events(&input, duration);
+    let timeline =
+        Timeline::build_with(&events, duration, &cfg.pacing, &markers.keep, &markers.cut);
+    if markers != Markers::default() {
+        log(format!(
+            "markers: {} keep, {} cut, {} frame, {} chapters",
+            markers.keep.len(),
+            markers.cut.len(),
+            markers.frame.len(),
+            markers.chapters.len()
+        ));
+    }
     summarize(&timeline, duration, events.len(), log);
 
     let geo = Geometry::new(&segment, cfg.output.size);
     let samples = read_windows(&dir.join("windows.jsonl"))?;
     let track = if cfg.camera.enabled {
-        CameraTrack::build(&samples, &timeline, &geo, &cfg.camera)
+        CameraTrack::build(&samples, &timeline, &geo, &cfg.camera, &markers.frame)
     } else {
         CameraTrack::fixed(&geo)
     };
@@ -152,7 +190,24 @@ pub fn run(
     let letterbox = Letterbox::new((segment.surface_px[0], segment.surface_px[1]), size);
     let mut src = FfmpegSource::open(&dir.join(&segment.file), segment, decode, fps as f64)
         .map_err(|e| e.to_string())?;
-    let mut sink = Box::new(FfmpegSink::create(out, size, fps).map_err(|e| e.to_string())?);
+    let chapters_file = out.with_extension("chapters.txt");
+    let chapters = if markers.chapters.is_empty() {
+        None
+    } else {
+        let starts: Vec<i64> = markers
+            .chapters
+            .iter()
+            .map(|&c| (timeline.out_time_at(c) * 1000.0) as i64)
+            .collect();
+        write_chapters(
+            &chapters_file,
+            &starts,
+            (timeline.out_duration() * 1000.0) as i64,
+        )?;
+        Some(chapters_file.as_path())
+    };
+    let mut sink =
+        Box::new(FfmpegSink::create(out, size, fps, chapters).map_err(|e| e.to_string())?);
 
     let framing = if cropping {
         Framing::Camera(&track)
@@ -236,6 +291,9 @@ pub fn run(
     )
     .map_err(|e| e.to_string())?;
     sink.finish().map_err(|e| e.to_string())?;
+    if chapters.is_some() {
+        let _ = fs::remove_file(&chapters_file);
+    }
     Ok(Report {
         out: out.to_owned(),
         frames,

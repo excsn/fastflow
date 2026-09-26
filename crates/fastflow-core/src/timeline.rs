@@ -169,6 +169,18 @@ impl Timeline {
     /// `events` and `duration` are in source seconds. Events outside `0..duration` still widen
     /// the human spans they pad into.
     pub fn build(events: &[f64], duration: f64, cfg: &PacingConfig) -> Timeline {
+        Timeline::build_with(events, duration, cfg, &[], &[])
+    }
+
+    /// As `build`, then `keep` ranges are made human and `cut` ranges idle. A cut wins where the
+    /// two overlap.
+    pub fn build_with(
+        events: &[f64],
+        duration: f64,
+        cfg: &PacingConfig,
+        keep: &[Range<f64>],
+        cut: &[Range<f64>],
+    ) -> Timeline {
         let mut spans = Vec::new();
         if duration <= 0.0 {
             return Timeline::from_spans(spans);
@@ -184,6 +196,11 @@ impl Timeline {
             })
             .filter(|(a, b)| a < b)
             .collect();
+        human.extend(
+            keep.iter()
+                .map(|r| (r.start.max(0.0), r.end.min(duration)))
+                .filter(|(a, b)| a < b),
+        );
         human.sort_by(|x, y| x.0.total_cmp(&y.0));
         let mut merged: Vec<(f64, f64)> = Vec::with_capacity(human.len());
         for (a, b) in human {
@@ -192,6 +209,7 @@ impl Timeline {
                 _ => merged.push((a, b)),
             }
         }
+        let merged = crate::markers::subtract(&merged, cut);
 
         let mut cursor = 0.0;
         for (i, &(a, b)) in merged.iter().enumerate() {
@@ -498,6 +516,26 @@ mod tests {
             let t = Timeline::build(&events, duration, &cfg);
             let out = t.out_time_at(f * duration);
             prop_assert!((t.src_time_at(out) - f * duration).abs() < 1e-6);
+        }
+
+        #[test]
+        fn keep_is_human_and_cut_never_is(
+            (events, duration, cfg) in case(),
+            k in 0.0..1.0f64,
+            c in 0.0..1.0f64,
+        ) {
+            let keep = [k * duration * 0.5..k * duration * 0.5 + duration * 0.2];
+            let cut = [c * duration * 0.5..c * duration * 0.5 + duration * 0.2];
+            let t = Timeline::build_with(&events, duration, &cfg, &keep, &cut);
+            for s in t.spans().iter().filter(|s| s.kind == SpanKind::Human) {
+                let inside_cut = s.src.start >= cut[0].start && s.src.end <= cut[0].end;
+                prop_assert!(!inside_cut || s.src.start == s.src.end, "{s:?} is inside the cut");
+            }
+            let mid = (keep[0].start + keep[0].end) / 2.0;
+            if !cut[0].contains(&mid) {
+                let span = t.spans().iter().find(|s| s.src.contains(&mid)).unwrap();
+                prop_assert_eq!(span.kind, SpanKind::Human);
+            }
         }
 
         #[test]

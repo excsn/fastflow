@@ -3,6 +3,8 @@
 //! Rects are normalized to the captured surface. The camera rect always has the output's pixel
 //! aspect, so it can be cropped and resized without distortion.
 
+use std::ops::Range;
+
 use crate::config::CameraConfig;
 use crate::geom::{Point, Rect};
 use crate::recording::{SegmentInfo, WindowInfo, WindowSample};
@@ -218,12 +220,14 @@ impl CameraTrack {
 
     /// `samples` must be in time order. Candidates are debounced in source time, since dwell is
     /// what shows intent. Moves are placed and timed in output time, so a transition takes
-    /// `transition_ms` on screen however fast the source is playing.
+    /// `transition_ms` on screen however fast the source is playing. Inside a `pinned` source
+    /// range the camera keeps its subject whatever the cursor does.
     pub fn build(
         samples: &[WindowSample],
         timeline: &Timeline,
         geo: &Geometry,
         cfg: &CameraConfig,
+        pinned: &[Range<f64>],
     ) -> CameraTrack {
         let mut track = CameraTrack::fixed(geo);
         let commit = cfg.commit_ms as f64 / 1000.0;
@@ -234,6 +238,10 @@ impl CameraTrack {
 
         for sample in samples {
             let t = sample.t as f64 / 1000.0;
+            if committed.is_some() && pinned.iter().any(|r| r.contains(&t)) {
+                candidate = None;
+                continue;
+            }
             let Some(w) = subject(sample, geo, cfg) else {
                 candidate = None;
                 continue;
@@ -460,7 +468,7 @@ mod tests {
     #[test]
     fn the_first_subject_is_adopted_without_a_move() {
         let samples = two_windows(2000, 0);
-        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg());
+        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg(), &[]);
         assert_eq!(track.move_count(), 0);
         assert_eq!(
             track.rect_at(1.0),
@@ -477,7 +485,7 @@ mod tests {
             .collect();
         samples[10].cursor = Point { x: 0.75, y: 0.75 };
         samples[11].cursor = Point { x: 0.75, y: 0.75 };
-        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg());
+        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg(), &[]);
         assert_eq!(track.move_count(), 0);
     }
 
@@ -490,7 +498,7 @@ mod tests {
             .collect();
         samples
             .extend((10..30).map(|i| sample(i * 100, 0.5, 0.5, vec![small.clone(), huge.clone()])));
-        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg());
+        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg(), &[]);
         assert_eq!(track.move_count(), 1);
     }
 
@@ -502,7 +510,7 @@ mod tests {
             .map(|i| sample(i * 100, 0.3, 0.3, vec![a.clone()]))
             .collect();
         samples.extend((10..30).map(|i| sample(i * 100, 0.3, 0.3, vec![b.clone()])));
-        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg());
+        let track = CameraTrack::build(&samples, &human_timeline(5.0), &geo(), &cfg(), &[]);
         assert_eq!(track.move_count(), 0);
     }
 
@@ -515,7 +523,7 @@ mod tests {
             .collect();
         samples.extend((10..30).map(|i| sample(i * 100, 0.3, 0.3, vec![b.clone()])));
         let timeline = human_timeline(5.0);
-        let track = CameraTrack::build(&samples, &timeline, &geo(), &cfg());
+        let track = CameraTrack::build(&samples, &timeline, &geo(), &cfg(), &[]);
         assert_eq!(track.move_count(), 0);
         let start = timeline.out_time_at(1.4);
         assert_eq!(track.focus_at(start - 0.01), vec![(1, 1.0)]);
@@ -540,11 +548,21 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_pin_holds_the_subject() {
+        let samples = two_windows(2000, 2000);
+        let t = human_timeline(5.0);
+        let pinned = CameraTrack::build(&samples, &t, &geo(), &cfg(), &[1.5..5.0]);
+        assert_eq!(pinned.move_count(), 0);
+        let released = CameraTrack::build(&samples, &t, &geo(), &cfg(), &[1.5..2.5]);
+        assert_eq!(released.move_count(), 1);
+    }
+
+    #[test]
     fn a_committed_switch_eases_over_the_transition() {
         let g = geo();
         let samples = two_windows(2000, 2000);
         let timeline = human_timeline(5.0);
-        let track = CameraTrack::build(&samples, &timeline, &g, &cfg());
+        let track = CameraTrack::build(&samples, &timeline, &g, &cfg(), &[]);
         assert_eq!(track.move_count(), 1);
         let start = timeline.out_time_at(2.4);
         let target = g.frame(samples.last().unwrap().windows[1].rect, &cfg());

@@ -13,6 +13,8 @@ const USAGE: &str = "usage:
   fastflow status                  what is recording and rendering
   fastflow list [n]                the newest n recordings, default 5
   fastflow render <id>             queue a re-render in the app
+  fastflow pin <id>                keep its raw footage past the 7-day sweep
+  fastflow unpin <id>
   fastflow render <dir> [-o <out.mp4>] [--boxes]
                                    render a recording directory here, without the app
 
@@ -28,6 +30,8 @@ fn main() -> ExitCode {
         (Some("list"), rest) => parse_limit(rest)
             .and_then(|limit| ask(Request::List { limit }))
             .map(print_list),
+        (Some("pin"), [id]) => set_pinned(id, true),
+        (Some("unpin"), [id]) => set_pinned(id, false),
         (Some("render"), [target]) if !std::path::Path::new(target).is_dir() => {
             ask(Request::Render { id: target.clone() }).map(|r| println!("queued {}", id(&r)))
         }
@@ -41,6 +45,23 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn set_pinned(id: &str, pinned: bool) -> Result<(), String> {
+    let dir = paths::recordings().join(id);
+    if !dir.join("meta.json").is_file() {
+        return Err(format!("no recording {id}"));
+    }
+    let pin = dir.join(fastflow_daemon::retention::PIN_FILE);
+    let result = if pinned {
+        std::fs::write(&pin, b"")
+    } else {
+        std::fs::remove_file(&pin).or_else(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(()),
+            _ => Err(e),
+        })
+    };
+    result.map_err(|e| format!("{}: {e}", pin.display()))
 }
 
 fn ask(request: Request) -> Result<Response, String> {

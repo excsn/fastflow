@@ -17,6 +17,16 @@ const SEARCH_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STDERR_TAIL: usize = 20;
 
+/// A plain mp4 writes its index last, so a killed capture leaves nothing readable. A fragmented
+/// one is readable up to its last complete fragment. A fragment closes at each keyframe.
+/// `h264_videotoolbox` ignores `-g`, so keyframes are forced every 2s.
+const RECOVERABLE: [&str; 4] = [
+    "-force_key_frames",
+    "expr:gte(t,n_forced*2)",
+    "-movflags",
+    "+frag_keyframe+empty_moov+default_base_moof",
+];
+
 pub struct FfmpegCapture {
     bin: PathBuf,
 }
@@ -112,6 +122,7 @@ impl ScreenCapture for FfmpegCapture {
                 "-pix_fmt",
                 "yuv420p",
             ])
+            .args(RECOVERABLE)
             .args(["-progress", "pipe:1", "-stats_period", "0.1", "-y"])
             .arg(&spec.out)
             .stdin(Stdio::piped())

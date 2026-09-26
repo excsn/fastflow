@@ -16,6 +16,8 @@ fastflow-core = { path = "crates/fastflow-core" }
 fastflow-daemon = { path = "crates/fastflow-daemon" }
 fastflow-desktop = { path = "crates/fastflow-desktop" }
 fast_image_resize = "6"
+global-hotkey = "0.8"
+libc = "0.2"
 fastflow-render = { path = "crates/fastflow-render" }
 objc2 = "0.6"
 objc2-app-kit = "0.3"

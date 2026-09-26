@@ -2,6 +2,7 @@ mod applog;
 mod build_id;
 mod notify;
 mod recorder;
+mod recovery;
 mod setup;
 
 use std::process::Command;
@@ -10,12 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use applog::log;
+use fastflow_core::recording::InputKind;
 use fastflow_daemon::paths;
 use fastflow_daemon::protocol::{Finished, Request, Response, Status};
 use fastflow_daemon::queue::RenderQueue;
+use fastflow_daemon::retention;
 use fastflow_daemon::server::{self, Handler};
 use fastflow_desktop::permissions::{self, Grant, Permission};
 use fastflow_render::job::{self, RenderJob};
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::MainThreadMarker;
 use recorder::Recorder;
 use setup::SetupWindow;
@@ -31,11 +36,57 @@ const PERMISSION_POLL: Duration = Duration::from_secs(2);
 const RECORDING_TICK: Duration = Duration::from_millis(100);
 const RENDERING_TICK: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SWEEP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+const DISK_CHECK_EVERY: Duration = Duration::from_secs(5);
 
 enum UserEvent {
     Menu(MenuEvent),
     Request(Request, Sender<Response>),
     RenderDone(Finished),
+    Hotkey(u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    ToggleRecording,
+    Mark(InputKind),
+}
+
+/// ⌃⌥⌘ plus a letter, chosen to stay clear of common app shortcuts.
+const BINDINGS: [(Code, Action); 5] = [
+    (Code::KeyR, Action::ToggleRecording),
+    (Code::KeyK, Action::Mark(InputKind::Keep)),
+    (Code::KeyX, Action::Mark(InputKind::Cut)),
+    (Code::KeyM, Action::Mark(InputKind::Chapter)),
+    (Code::KeyF, Action::Mark(InputKind::Frame)),
+];
+
+struct Hotkeys {
+    _manager: GlobalHotKeyManager,
+    actions: Vec<(u32, Action)>,
+}
+
+fn register_hotkeys(proxy: EventLoopProxy<UserEvent>) -> Result<Hotkeys, String> {
+    let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
+    let mods = Modifiers::CONTROL | Modifiers::ALT | Modifiers::SUPER;
+    let mut actions = Vec::new();
+    for (code, action) in BINDINGS {
+        let hotkey = HotKey::new(Some(mods), code);
+        match manager.register(hotkey) {
+            Ok(()) => actions.push((hotkey.id(), action)),
+            Err(e) => log(format!("hotkey {code:?}: {e}")),
+        }
+    }
+    let proxy = Mutex::new(proxy);
+    GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+        if e.state == HotKeyState::Pressed {
+            let _ = proxy.lock().unwrap().send_event(UserEvent::Hotkey(e.id));
+        }
+    }));
+    Ok(Hotkeys {
+        _manager: manager,
+        actions,
+    })
 }
 
 /// Socket requests run on the main thread, where the recorder and its event tap live.
@@ -80,6 +131,9 @@ struct App {
     setup: Option<SetupWindow>,
     recorder: Option<Recorder>,
     queue: Option<RenderQueue>,
+    last_sweep: Option<Instant>,
+    last_disk_check: Option<Instant>,
+    hotkeys: Option<Hotkeys>,
 }
 
 impl App {
@@ -94,7 +148,7 @@ impl App {
                 grant: None,
             })
             .collect();
-        let record = MenuItem::new("Start Recording", true, None);
+        let record = MenuItem::new("Start Recording  ⌃⌥⌘R", true, None);
         let render_state = MenuItem::new("No renders yet", false, None);
         let reveal = MenuItem::new("Show Last Render", false, None);
         let quit = MenuItem::new("Quit", true, None);
@@ -164,8 +218,24 @@ impl App {
             "launch build {build:?}, last granted build {last:?}"
         ));
         self.build_tray();
+        let recovered = recovery::recover_all();
+        self.sweep();
         self.start_daemon();
+        match register_hotkeys(self.proxy.clone()) {
+            Ok(h) => self.hotkeys = Some(h),
+            Err(e) => log(format!("hotkeys: {e}")),
+        }
         notify::request_permission();
+        if !recovered.is_empty() {
+            notify::post(
+                "recovered",
+                "Recovered an unfinished recording",
+                &format!(
+                    "{}. Render it from the CLI with fastflow render <id>.",
+                    recovered.join(", ")
+                ),
+            );
+        }
         let all_granted = Permission::ALL
             .iter()
             .all(|&p| permissions::check(p) == Grant::Granted);
@@ -210,9 +280,44 @@ impl App {
         }
     }
 
+    fn sweep(&mut self) {
+        self.last_sweep = Some(Instant::now());
+        let swept = retention::sweep(
+            &paths::recordings(),
+            std::time::SystemTime::now(),
+            retention::RAW_KEEP,
+        );
+        for s in &swept {
+            log(format!(
+                "swept raw footage of {}: {} MB",
+                s.id,
+                s.bytes >> 20
+            ));
+        }
+    }
+
+    fn free_space(&self) -> Option<u64> {
+        let root = paths::recordings();
+        let _ = std::fs::create_dir_all(&root);
+        retention::free_bytes(&root)
+    }
+
     fn start_recording(&mut self) -> Result<String, String> {
         if let Some(r) = &self.recorder {
             return Err(format!("already recording {}", r.id()));
+        }
+        match self.free_space() {
+            Some(free) if free < retention::REFUSE_BELOW => {
+                return Err(format!("only {} GB free, not starting", free >> 30));
+            }
+            Some(free) if free < retention::WARN_BELOW => {
+                notify::post(
+                    "disk",
+                    "Low disk space",
+                    &format!("{} GB free. Recording stops below 2 GB.", free >> 30),
+                );
+            }
+            _ => {}
         }
         let r = Recorder::start()?;
         let id = r.id();
@@ -285,6 +390,22 @@ impl App {
         result.unwrap_or_else(Response::error)
     }
 
+    fn on_hotkey(&mut self, id: u32) {
+        let action = self
+            .hotkeys
+            .as_ref()
+            .and_then(|h| h.actions.iter().find(|(i, _)| *i == id))
+            .map(|(_, a)| *a);
+        match action {
+            Some(Action::ToggleRecording) => self.toggle_recording(),
+            Some(Action::Mark(kind)) => match &self.recorder {
+                Some(r) => r.mark(kind),
+                None => log(format!("marker {kind:?} ignored: not recording")),
+            },
+            None => {}
+        }
+    }
+
     fn on_render_done(&mut self, f: Finished) {
         match &f.result {
             Ok(path) => {
@@ -337,16 +458,36 @@ impl App {
         let Some(tray) = &self.tray else { return };
         let recording = self.recorder.is_some();
         tray.record.set_text(if recording {
-            "Stop Recording"
+            "Stop Recording  ⌃⌥⌘R"
         } else {
-            "Start Recording"
+            "Start Recording  ⌃⌥⌘R"
         });
         let _ = tray.icon.set_icon(Some(tray_glyph(recording)));
         tray.icon.set_icon_as_template(true);
     }
 
     fn tick_recording(&mut self) {
+        let due = self
+            .last_disk_check
+            .is_none_or(|t| t.elapsed() >= DISK_CHECK_EVERY);
+        let low = due && self.free_space().is_some_and(|f| f < retention::STOP_BELOW);
+        if due {
+            self.last_disk_check = Some(Instant::now());
+        }
         let Some(r) = &mut self.recorder else { return };
+        if low {
+            log("disk nearly full, stopping the recording");
+            r.truncate("disk_full");
+            if let Err(e) = self.stop_recording() {
+                log(format!("stop: {e}"));
+            }
+            notify::post(
+                "disk",
+                "Recording stopped",
+                "Less than 2 GB of disk space left.",
+            );
+            return;
+        }
         if let Err(why) = r.tick() {
             log(format!("capture ended unexpectedly: {why}"));
             if let Some(r) = self.recorder.take() {
@@ -388,6 +529,9 @@ impl ApplicationHandler<UserEvent> for App {
             StartCause::ResumeTimeReached { .. } => {
                 self.tick_recording();
                 self.show_render_state();
+                if self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
+                    self.sweep();
+                }
                 self.refresh_permissions();
                 if let Some(setup) = self.setup.as_ref().filter(|s| s.is_visible()) {
                     setup.refresh();
@@ -418,6 +562,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = reply.send(self.handle_request(request));
             }
             UserEvent::RenderDone(f) => self.on_render_done(f),
+            UserEvent::Hotkey(id) => self.on_hotkey(id),
         }
     }
 
@@ -462,6 +607,9 @@ fn main() {
         setup: None,
         recorder: None,
         queue: None,
+        last_sweep: None,
+        last_disk_check: None,
+        hotkeys: None,
     };
     event_loop.run_app(&mut app).expect("event loop");
 }

@@ -15,6 +15,20 @@ pub enum InputKind {
     MouseMove,
     MouseDrag,
     Scroll,
+    /// Marker hotkeys. Keep, Cut and Frame toggle a range on and off; Chapter marks a point.
+    Keep,
+    Cut,
+    Chapter,
+    Frame,
+}
+
+impl InputKind {
+    pub fn is_marker(self) -> bool {
+        matches!(
+            self,
+            InputKind::Keep | InputKind::Cut | InputKind::Chapter | InputKind::Frame
+        )
+    }
 }
 
 /// One line of `input.jsonl`. Records that an event happened, never which key.

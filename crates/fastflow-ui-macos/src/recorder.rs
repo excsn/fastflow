@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use fastflow_capture::{CaptureSession, CaptureSpec};
 use fastflow_core::geom::Point;
 use fastflow_core::recording::{
-    FORMAT_VERSION, InputEvent, Meta, SegmentInfo, WindowInfo, WindowSample,
+    FORMAT_VERSION, InputEvent, InputKind, Meta, SegmentInfo, WindowInfo, WindowSample,
 };
 use fastflow_daemon::paths;
 use fastflow_desktop::macos::display::{self, Display};
@@ -149,6 +149,20 @@ impl Recorder {
             Some(why) => Err(why),
             None => Ok(()),
         }
+    }
+
+    /// Writes a marker into `input.jsonl` at the current moment.
+    pub fn mark(&self, kind: InputKind) {
+        let _ = self.records.send(Record::Input(RawInput {
+            at: Instant::now(),
+            kind,
+        }));
+        log(format!("marker {kind:?}"));
+    }
+
+    /// Recorded in `meta.json` when the recording is stopped for a reason other than the user.
+    pub fn truncate(&mut self, why: &str) {
+        self.meta.truncated_by = Some(why.to_owned());
     }
 
     pub fn id(&self) -> String {

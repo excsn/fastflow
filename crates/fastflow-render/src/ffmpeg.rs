@@ -163,13 +163,28 @@ pub struct FfmpegSink {
 }
 
 impl FfmpegSink {
-    pub fn create(path: &Path, size: (u32, u32), fps: u32) -> Result<Self> {
+    /// `chapters` is an ffmetadata file whose chapters are copied into the output.
+    pub fn create(
+        path: &Path,
+        size: (u32, u32),
+        fps: u32,
+        chapters: Option<&Path>,
+    ) -> Result<Self> {
         let bin = locate()?;
-        let mut child = Command::new(bin)
-            .args(["-v", "error", "-y"])
+        let mut cmd = Command::new(bin);
+        cmd.args(["-v", "error", "-y"])
             .args(["-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{}x{}", size.0, size.1)])
-            .args(["-r", &fps.to_string(), "-i", "pipe:0"])
+            .args(["-r", &fps.to_string(), "-i", "pipe:0"]);
+        if let Some(meta) = chapters {
+            cmd.args(["-f", "ffmetadata", "-i"]).arg(meta).args([
+                "-map",
+                "0:v",
+                "-map_chapters",
+                "1",
+            ]);
+        }
+        let mut child = cmd
             .args([
                 "-c:v",
                 "h264_videotoolbox",
