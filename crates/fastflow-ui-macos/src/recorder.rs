@@ -43,12 +43,10 @@ pub struct Recorder {
     sampler: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     latest: Arc<Mutex<Option<WindowSample>>>,
-    overlay: Option<OverlayParams>,
 }
 
-/// What the live overlay needs, present only when the backend keeps fastflow's own windows out
+/// What the live overlay needs. Offered only when the backend keeps fastflow's own windows out
 /// of the footage.
-#[derive(Clone)]
 pub struct OverlayParams {
     pub display_pt: Rect,
     pub geo: Geometry,
@@ -62,7 +60,9 @@ struct State {
 }
 
 impl Recorder {
-    pub fn start() -> Result<Self, String> {
+    /// `before_capture` runs when the overlay is wanted, before the capture starts. ScreenCaptureKit
+    /// can only exclude an app that already has a window, so the overlay must exist by then.
+    pub fn start(before_capture: &mut dyn FnMut(&OverlayParams)) -> Result<Self, String> {
         let display = display::under_cursor().ok_or("no active display")?;
         let started = chrono::Local::now();
         let dir = paths::recordings().join(started.format("%Y-%m-%d-%H%M%S").to_string());
@@ -81,6 +81,13 @@ impl Recorder {
         let mut backend =
             fastflow_capture::detect(&cfg.capture.backend).map_err(|e| e.to_string())?;
         let file = fastflow_capture::segment_file(backend.name(), 0);
+        if backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay {
+            before_capture(&OverlayParams {
+                display_pt: display.bounds_pt,
+                geo: Geometry::new(&segment(&display, file.clone()), cfg.output.size),
+                camera: cfg.camera.clone(),
+            });
+        }
         let capture = backend
             .start(&CaptureSpec {
                 display_index: display.index,
@@ -141,13 +148,6 @@ impl Recorder {
             let mut source = MacWindowSource::new(display.bounds_pt);
             thread::spawn(move || sample_windows(&mut source, &sampling, &tx, &latest))
         };
-        let overlay =
-            (backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay)
-                .then(|| OverlayParams {
-                    display_pt: display.bounds_pt,
-                    geo: Geometry::new(&meta.segments[0], cfg.output.size),
-                    camera: cfg.camera.clone(),
-                });
 
         Ok(Recorder {
             dir,
@@ -160,12 +160,7 @@ impl Recorder {
             sampler: Some(sampler),
             writer: Some(writer),
             latest,
-            overlay,
         })
-    }
-
-    pub fn overlay_params(&self) -> Option<OverlayParams> {
-        self.overlay.clone()
     }
 
     /// The newest window sample, timed from when sampling started.

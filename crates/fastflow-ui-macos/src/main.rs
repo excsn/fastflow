@@ -327,18 +327,28 @@ impl App {
             }
             _ => {}
         }
-        let r = Recorder::start()?;
-        let id = r.id();
-        if let Some(p) = r.overlay_params() {
+        let mut shown = None;
+        let started = Recorder::start(&mut |p| {
             let mtm = MainThreadMarker::new().expect("main thread");
-            self.overlay = Some(overlay::Overlay::new(
+            shown = Some(overlay::Overlay::new(
                 mtm,
                 p.display_pt,
                 fastflow_desktop::macos::display::primary_height(),
                 p.geo,
-                p.camera,
+                p.camera.clone(),
             ));
-        }
+        });
+        let r = match started {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(o) = shown {
+                    o.close();
+                }
+                return Err(e);
+            }
+        };
+        let id = r.id();
+        self.overlay = shown;
         self.recorder = Some(r);
         self.show_recording_state();
         Ok(id)

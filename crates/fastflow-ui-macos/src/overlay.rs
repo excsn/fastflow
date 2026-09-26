@@ -12,7 +12,7 @@ use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSStatusWindowLevel, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWindowCollectionBehavior, NSWindowSharingType, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -101,6 +101,7 @@ impl Overlay {
         window.setBackgroundColor(Some(&NSColor::clearColor()));
         window.setHasShadow(false);
         window.setIgnoresMouseEvents(true);
+        window.setSharingType(NSWindowSharingType::None);
         window.setLevel(NSStatusWindowLevel);
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
