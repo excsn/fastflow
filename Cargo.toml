@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+core-foundation = "0.10"
+core-graphics = "0.25"
+fastflow-capture = { path = "crates/fastflow-capture" }
+fastflow-core = { path = "crates/fastflow-core" }
+fastflow-desktop = { path = "crates/fastflow-desktop" }
+fast_image_resize = "6"
+fastflow-render = { path = "crates/fastflow-render" }
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+serde = { version = "1", features = ["derive"] }
+proptest = "1"
+serde_json = "1"
+toml = "1"
+tray-icon = "0.25"
+winit = "0.30"
+
+[profile.release]
+debug = true

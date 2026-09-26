@@ -1,0 +1,9 @@
+[package]
+name = "fastflow-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fast_image_resize.workspace = true
+fastflow-core.workspace = true
