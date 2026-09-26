@@ -413,6 +413,10 @@ impl App {
                     Ok(Response::with_id(id))
                 }
             }
+            Request::Resegment => match self.recorder.as_mut() {
+                Some(r) => r.resegment().map(|()| Response::with_id(r.id())),
+                None => Err("not recording".into()),
+            },
             Request::List { limit } => Ok(Response {
                 recordings: Some(paths::list_recordings(limit)),
                 ..Response::ok()
@@ -522,7 +526,21 @@ impl App {
             );
             return;
         }
-        if let Err(why) = r.tick() {
+        let ticked = r.tick();
+        if let Ok(Some(recorder::Event::Switched(p))) = &ticked {
+            if let Some(o) = self.overlay.take() {
+                o.close();
+            }
+            let mtm = MainThreadMarker::new().expect("main thread");
+            self.overlay = Some(overlay::Overlay::new(
+                mtm,
+                p.display_pt,
+                fastflow_desktop::macos::display::primary_height(),
+                p.geo,
+                p.camera.clone(),
+            ));
+        }
+        if let Err(why) = ticked {
             log(format!("capture ended unexpectedly: {why}"));
             if let Some(o) = self.overlay.take() {
                 o.close();

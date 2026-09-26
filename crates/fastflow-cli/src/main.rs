@@ -33,6 +33,9 @@ fn main() -> ExitCode {
         (Some("list"), rest) => parse_limit(rest)
             .and_then(|limit| ask(Request::List { limit }))
             .map(print_list),
+        (Some("resegment"), []) => {
+            ask(Request::Resegment).map(|r| println!("new segment in {}", id(&r)))
+        }
         (Some("diagram"), [target]) => diagram(target, 100),
         (Some("diagram"), [target, cols]) => cols
             .parse()
@@ -84,10 +87,12 @@ fn resolve(target: &str) -> Result<PathBuf, String> {
 fn diagram(target: &str, cols: usize) -> Result<(), String> {
     let dir = resolve(target)?;
     let plan = job::plan(&dir, &mut |_| {})?;
+    let cameras: Vec<(f64, &fastflow_core::camera::CameraTrack)> =
+        plan.segments.iter().map(|s| (s.start, &s.track)).collect();
     let text = fastflow_core::diagram::render(
         &fastflow_core::diagram::Inputs {
             timeline: &plan.timeline,
-            camera: &plan.track,
+            cameras: &cameras,
             events: &plan.events,
             markers: &plan.markers,
             duration: plan.duration,

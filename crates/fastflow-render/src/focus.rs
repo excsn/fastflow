@@ -42,15 +42,13 @@ fn resize_err(e: impl std::fmt::Display) -> RenderError {
 }
 
 impl FocusBlur {
+    /// With no masks the whole frame blurs. So does a set whose weights are all zero.
     pub fn apply(
         &mut self,
         frame: &mut Frame,
         masks: &[FocusMask],
         s: &FocusSettings,
     ) -> Result<()> {
-        if masks.iter().all(|m| m.weight <= 0.0) {
-            return Ok(());
-        }
         self.blur(frame, s.blur)?;
 
         let (w, h) = (frame.width as usize, frame.height as usize);
@@ -243,13 +241,16 @@ mod tests {
     }
 
     #[test]
-    fn no_focus_leaves_the_frame_alone() {
-        let mut f = stripes(64, 64);
-        let before = f.clone();
+    fn no_masks_blurs_everything() {
+        let mut f = stripes(160, 160);
         FocusBlur::default()
             .apply(&mut f, &[], &settings())
             .unwrap();
-        assert_eq!(f, before);
+        let (a, b) = (value(&f, 80, 80), value(&f, 81, 80));
+        assert!(
+            a.abs_diff(b) < 60,
+            "stripes should be smeared, got {a} and {b}"
+        );
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub enum Request {
         #[serde(default = "default_limit")]
         limit: usize,
     },
+    /// Start a new segment on the current display through the same overlapping switch a display
+    /// change uses. For testing segmented recordings on one display.
+    Resegment,
 }
 
 fn default_limit() -> usize {

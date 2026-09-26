@@ -119,6 +119,34 @@ fn overlap(a: &Rect, b: &Rect) -> f64 {
     i / (a.w * a.h + b.w * b.h - i)
 }
 
+/// Window layers the Dock draws Mission Control and App Exposé at.
+const OVERVIEW_LAYERS: [i32; 2] = [18, 20];
+
+/// Whether Mission Control or App Exposé is on screen. The Dock covers the display with windows
+/// at its own layers while either runs. The window list keeps reporting every window at its real
+/// position rather than its thumbnail, so nothing under the cursor means anything meanwhile.
+pub fn is_overview(sample: &WindowSample) -> bool {
+    sample
+        .windows
+        .iter()
+        .any(|w| OVERVIEW_LAYERS.contains(&w.layer) && w.rect.w >= 0.9 && w.rect.h >= 0.9)
+}
+
+/// The frontmost normal window, ignoring windows below `min_window_size`. After Mission Control
+/// this is the window that was picked, wherever the cursor ended up.
+pub fn frontmost<'a>(
+    sample: &'a WindowSample,
+    geo: &Geometry,
+    cfg: &CameraConfig,
+) -> Option<&'a WindowInfo> {
+    let min_w = cfg.min_window_size[0] / geo.surface_pt.0;
+    let min_h = cfg.min_window_size[1] / geo.surface_pt.1;
+    sample
+        .windows
+        .iter()
+        .find(|w| w.layer == 0 && w.rect.w >= min_w && w.rect.h >= min_h)
+}
+
 /// The topmost normal window under the cursor, ignoring windows below `min_window_size`.
 /// `windows` is front to back.
 pub fn subject<'a>(
@@ -147,6 +175,16 @@ pub struct Move {
 /// What the director decided on a sample.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
+    /// Mission Control or App Exposé opened. The camera holds and nothing is in focus.
+    OverviewStart { at: f64 },
+    /// It closed. `id` is the frontmost window, which is the one picked. When nothing was picked it
+    /// is the one focused before. It is committed at once, since picking is intent.
+    OverviewEnd {
+        at: f64,
+        previous: Option<u32>,
+        id: u32,
+        rect: Rect,
+    },
     /// The first subject, taken without a move.
     Adopt { id: u32, rect: Rect },
     /// A new subject after the debounce. The same window moving or resizing counts too. `at` is
@@ -165,6 +203,7 @@ pub enum Decision {
 pub struct Director {
     committed: Option<(u32, Rect)>,
     candidate: Option<(u32, Rect, f64)>,
+    in_overview: bool,
 }
 
 impl Director {
@@ -180,6 +219,26 @@ impl Director {
         if self.committed.is_some() && pinned {
             self.candidate = None;
             return None;
+        }
+        if is_overview(sample) {
+            self.candidate = None;
+            if self.in_overview {
+                return None;
+            }
+            self.in_overview = true;
+            return Some(Decision::OverviewStart { at: t });
+        }
+        if self.in_overview {
+            let w = frontmost(sample, geo, cfg)?;
+            self.in_overview = false;
+            let previous = self.committed.map(|c| c.0);
+            self.committed = Some((w.id, w.rect));
+            return Some(Decision::OverviewEnd {
+                at: t,
+                previous,
+                id: w.id,
+                rect: w.rect,
+            });
         }
         let Some(w) = subject(sample, geo, cfg) else {
             self.candidate = None;
@@ -259,13 +318,16 @@ struct FocusChange {
     start: f64,
     duration: f64,
     from: Option<u32>,
-    to: u32,
+    /// `None` while Mission Control is up: everything is out of focus.
+    to: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CameraTrack {
     initial: Rect,
     moves: Vec<Move>,
+    /// Output start and end of each Mission Control spell. An unclosed one ends at infinity.
+    overviews: Vec<(f64, f64)>,
     initial_focus: Option<u32>,
     /// Every commit to a different window, including those the overlap hold kept the camera
     /// still for.
@@ -329,6 +391,7 @@ impl CameraTrack {
         CameraTrack {
             initial: geo.full(),
             moves: Vec::new(),
+            overviews: Vec::new(),
             initial_focus: None,
             focus: Vec::new(),
         }
@@ -357,6 +420,33 @@ impl CameraTrack {
                     track.initial = geo.frame(rect, cfg);
                     track.initial_focus = Some(id);
                 }
+                Some(Decision::OverviewStart { at }) => {
+                    let at = timeline.out_time_at(at);
+                    let from = track.focus_target_at(at);
+                    track.focus.push(FocusChange {
+                        start: at,
+                        duration: transition,
+                        from,
+                        to: None,
+                    });
+                    track.overviews.push((at, f64::INFINITY));
+                }
+                Some(Decision::OverviewEnd { at, id, rect, .. }) => {
+                    let at = timeline.out_time_at(at);
+                    if let Some(o) = track.overviews.last_mut() {
+                        o.1 = at;
+                    }
+                    track.focus.push(FocusChange {
+                        start: at,
+                        duration: transition,
+                        from: None,
+                        to: Some(id),
+                    });
+                    if let Some(m) = plan_move(at, track.rect_at(at), rect, geo, cfg) {
+                        track.moves.retain(|m| m.start < at);
+                        track.moves.push(m);
+                    }
+                }
                 Some(Decision::Commit {
                     previous,
                     id,
@@ -369,7 +459,7 @@ impl CameraTrack {
                             start: at,
                             duration: transition,
                             from: Some(previous),
-                            to: id,
+                            to: Some(id),
                         });
                     }
                     if let Some(m) = plan_move(at, track.rect_at(at), rect, geo, cfg) {
@@ -406,8 +496,28 @@ impl CameraTrack {
         self.initial_focus
             .map(|id| (0.0, id))
             .into_iter()
-            .chain(self.focus.iter().map(|c| (c.start, c.to)))
+            .chain(self.focus.iter().filter_map(|c| Some((c.start, c.to?))))
             .collect()
+    }
+
+    /// Whether any window has been chosen by `out_t`. Before that the frame stays sharp. After
+    /// it, a moment with no focused window is Mission Control and everything blurs.
+    pub fn focused_at(&self, out_t: f64) -> bool {
+        self.initial_focus.is_some() || self.focus.first().is_some_and(|c| c.start <= out_t)
+    }
+
+    /// Output start and end of each Mission Control spell.
+    pub fn overviews(&self) -> &[(f64, f64)] {
+        &self.overviews
+    }
+
+    /// The window focus is heading to at `out_t`.
+    fn focus_target_at(&self, out_t: f64) -> Option<u32> {
+        let i = self.focus.partition_point(|c| c.start <= out_t);
+        match i.checked_sub(1) {
+            None => self.initial_focus,
+            Some(i) => self.focus[i].to,
+        }
     }
 
     /// Focused windows and how focused each is, 0 to 1. Two entries mid-crossfade, none before
@@ -418,14 +528,12 @@ impl CameraTrack {
             return self.initial_focus.map(|id| (id, 1.0)).into_iter().collect();
         };
         let u = ((out_t - c.start) / c.duration).clamp(0.0, 1.0);
-        if u >= 1.0 {
-            return vec![(c.to, 1.0)];
-        }
         let s = ease_in_out_cubic(u);
-        let mut out = vec![(c.to, s)];
-        if let Some(from) = c.from {
+        let mut out: Vec<(u32, f64)> = c.to.map(|id| (id, s)).into_iter().collect();
+        if let Some(from) = c.from.filter(|_| u < 1.0) {
             out.push((from, 1.0 - s));
         }
+        out.retain(|e| e.1 > 0.0);
         out
     }
 }
@@ -642,6 +750,68 @@ mod tests {
         assert_eq!(pinned.move_count(), 0);
         let released = CameraTrack::build(&samples, &t, &geo(), &cfg(), &[1.5..2.5]);
         assert_eq!(released.move_count(), 1);
+    }
+
+    fn mission_control(t: i64, cx: f64, windows: Vec<WindowInfo>) -> WindowSample {
+        let mut s = sample(t, cx, 0.5, windows);
+        let mut dock = window(99, 0.0, 0.0, 1.0, 1.0);
+        dock.layer = 20;
+        s.windows.insert(0, dock);
+        s
+    }
+
+    /// 1s on `a`, 1s of Mission Control with the cursor over `b`, then 1s with `front` frontmost
+    /// and the cursor on it.
+    fn through_mission_control(front: &WindowInfo) -> (Vec<WindowSample>, Timeline) {
+        let a = window(1, 0.05, 0.05, 0.3, 0.3);
+        let b = window(2, 0.6, 0.6, 0.3, 0.3);
+        let others: Vec<WindowInfo> = [&a, &b]
+            .into_iter()
+            .filter(|w| w.id != front.id)
+            .cloned()
+            .collect();
+        let mut samples: Vec<_> = (0..10)
+            .map(|i| sample(i * 100, 0.2, 0.2, vec![a.clone(), b.clone()]))
+            .collect();
+        samples
+            .extend((10..20).map(|i| mission_control(i * 100, 0.75, vec![a.clone(), b.clone()])));
+        let (cx, cy) = (front.rect.x + 0.1, front.rect.y + 0.1);
+        samples.extend((20..30).map(|i| {
+            let mut ws = vec![front.clone()];
+            ws.extend(others.iter().cloned());
+            sample(i * 100, cx, cy, ws)
+        }));
+        (samples, human_timeline(4.0))
+    }
+
+    #[test]
+    fn mission_control_holds_the_camera_and_blurs_everything() {
+        let a = window(1, 0.05, 0.05, 0.3, 0.3);
+        let (samples, t) = through_mission_control(&a);
+        let track = CameraTrack::build(&samples, &t, &geo(), &cfg(), &[]);
+        assert_eq!(
+            track.move_count(),
+            0,
+            "cursor over b during Mission Control must not move"
+        );
+        let during = t.out_time_at(1.9);
+        assert!(track.focus_at(during).is_empty() && track.focused_at(during));
+        assert_eq!(track.focus_at(t.out_time_at(3.0)), vec![(1, 1.0)]);
+        assert_eq!(track.overviews().len(), 1);
+    }
+
+    #[test]
+    fn the_window_picked_in_mission_control_is_framed_at_once() {
+        let b = window(2, 0.6, 0.6, 0.3, 0.3);
+        let (samples, t) = through_mission_control(&b);
+        let track = CameraTrack::build(&samples, &t, &geo(), &cfg(), &[]);
+        assert_eq!(track.move_count(), 1);
+        let (start, _) = track.moves()[0];
+        assert!(
+            (start - t.out_time_at(2.0)).abs() < 1e-9,
+            "no debounce after a pick"
+        );
+        assert_eq!(track.focus_at(t.out_time_at(3.0)), vec![(2, 1.0)]);
     }
 
     #[test]

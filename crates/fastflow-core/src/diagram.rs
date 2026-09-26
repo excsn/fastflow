@@ -10,7 +10,8 @@ const TICK_EVERY: usize = 10;
 
 pub struct Inputs<'a> {
     pub timeline: &'a Timeline,
-    pub camera: &'a CameraTrack,
+    /// Each segment's source start and camera track, in order.
+    pub cameras: &'a [(f64, &'a CameraTrack)],
     /// Human input times in source seconds.
     pub events: &'a [f64],
     pub markers: &'a Markers,
@@ -88,34 +89,65 @@ pub fn render(i: &Inputs, width: usize) -> String {
     lines.push(row("pacing", &pacing));
 
     let mut camera = vec!['─'; width];
-    for (start, dur) in i.camera.moves() {
-        let a = column(i.timeline.src_time_at(start), d, width);
-        let b = column(i.timeline.src_time_at(start + dur), d, width);
-        for cell in &mut camera[a..=b.max(a)] {
-            *cell = '~';
+    let mut names: Vec<u32> = Vec::new();
+    for (k, &(seg_start, track)) in i.cameras.iter().enumerate() {
+        let seg_end = i.cameras.get(k + 1).map_or(d, |c| c.0);
+        let in_segment = |t: f64| t >= seg_start && t < seg_end;
+        for (start, dur) in track.moves() {
+            let (a, b) = (
+                i.timeline.src_time_at(start),
+                i.timeline.src_time_at(start + dur),
+            );
+            if !in_segment(a) {
+                continue;
+            }
+            let (a, b) = (column(a, d, width), column(b.min(seg_end), d, width));
+            for cell in &mut camera[a..=b.max(a)] {
+                *cell = '~';
+            }
+        }
+        for (start, id) in track.focus_changes() {
+            let t = i.timeline.src_time_at(start).max(seg_start);
+            if !in_segment(t) {
+                continue;
+            }
+            if !names.contains(&id) {
+                names.push(id);
+            }
+            let letter = (b'A' + (names.iter().position(|&n| n == id).unwrap() % 26) as u8) as char;
+            camera[column(t, d, width)] = letter;
         }
     }
-    let mut names: Vec<u32> = Vec::new();
-    for (start, id) in i.camera.focus_changes() {
-        if !names.contains(&id) {
-            names.push(id);
+    for &(_, track) in i.cameras {
+        for &(a, b) in track.overviews() {
+            let a = column(i.timeline.src_time_at(a), d, width);
+            let b = column(
+                i.timeline.src_time_at(b.min(i.timeline.out_duration())),
+                d,
+                width,
+            );
+            for cell in &mut camera[a..=b.max(a)] {
+                *cell = 'M';
+            }
         }
-        let letter = (b'A' + (names.iter().position(|&n| n == id).unwrap() % 26) as u8) as char;
-        camera[column(i.timeline.src_time_at(start), d, width)] = letter;
+    }
+    for &(seg_start, _) in i.cameras.iter().skip(1) {
+        camera[column(seg_start, d, width)] = '┃';
     }
     lines.push(row("camera", &camera));
 
     lines.push(String::new());
     lines.push(format!(
-        "{:<LABEL$}█ human  ▒ ramp  ░ idle   camera: A.. window, ~ moving",
+        "{:<LABEL$}█ human  ▒ ramp  ░ idle   camera: A.. window, ~ moving, M mission control, ┃ display switch",
         ""
     ));
     lines.push(format!(
-        "{:<LABEL$}source {:.1}s -> output {:.1}s, {} camera moves",
+        "{:<LABEL$}source {:.1}s -> output {:.1}s, {} camera moves, {} segments",
         "",
         d,
         i.timeline.out_duration(),
-        i.camera.move_count()
+        i.cameras.iter().map(|c| c.1.move_count()).sum::<usize>(),
+        i.cameras.len()
     ));
     lines.join("\n")
 }
@@ -138,7 +170,7 @@ mod tests {
         let out = render(
             &Inputs {
                 timeline: &t,
-                camera: &cam,
+                cameras: &[(0.0, &cam)],
                 events: &[10.0, 10.5],
                 markers: &Markers::default(),
                 duration: 40.0,

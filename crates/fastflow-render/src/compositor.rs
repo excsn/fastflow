@@ -1,4 +1,4 @@
-use fastflow_core::camera::CameraTrack;
+use fastflow_core::camera::{CameraTrack, ease_in_out_cubic};
 use fastflow_core::timeline::Timeline;
 
 use crate::crop::Cropper;
@@ -24,45 +24,114 @@ pub fn out_frame_count(timeline: &Timeline, fps: u32) -> u64 {
     (timeline.out_duration() * fps as f64).ceil() as u64
 }
 
-/// One forward pass over the source.
-pub fn render(
-    src: &mut dyn FrameSource,
+/// One stretch of footage from one display. Its file's time 0 is source time `start`.
+pub struct Segment<'a> {
+    pub source: &'a mut dyn FrameSource,
+    pub framing: Framing<'a>,
+    pub overlay: Option<Overlay<'a>>,
+    pub start: f64,
+}
+
+/// One forward pass over a single source.
+pub fn render<'a>(
+    src: &'a mut dyn FrameSource,
     sink: &mut dyn FrameSink,
     timeline: &Timeline,
-    framing: Framing,
-    mut overlay: Option<Overlay>,
+    framing: Framing<'a>,
+    overlay: Option<Overlay<'a>>,
+    settings: RenderSettings,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<u64> {
+    let mut segments = [Segment {
+        source: src,
+        framing,
+        overlay,
+        start: 0.0,
+    }];
+    render_segments(&mut segments, sink, timeline, 0.0, settings, progress)
+}
+
+/// One forward pass over consecutive segments. Within `dissolve` output seconds centred on each
+/// boundary, the outgoing and incoming segments are cross-dissolved. The outgoing side plays on
+/// into the footage the two captures overlapped by, then holds its last frame. The incoming side
+/// holds its first frame until the boundary.
+pub fn render_segments(
+    segments: &mut [Segment],
+    sink: &mut dyn FrameSink,
+    timeline: &Timeline,
+    dissolve: f64,
     settings: RenderSettings,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<u64> {
     let total = out_frame_count(timeline, settings.fps);
     let mut out = Frame::black(settings.size.0, settings.size.1);
+    let mut incoming = Frame::black(settings.size.0, settings.size.1);
     let mut cropper = Cropper::default();
+    let boundaries: Vec<f64> = segments
+        .iter()
+        .skip(1)
+        .map(|s| timeline.out_time_at(s.start))
+        .collect();
     for n in 0..total {
         let out_t = n as f64 / settings.fps as f64;
         let src_t = timeline.src_time_at(out_t);
-        let frame = src.advance_to(src_t)?;
-        match (&framing, overlay.as_mut()) {
-            (Framing::Prefitted, None) => {
-                check_size(frame, settings.size)?;
-                sink.write(frame)?;
+        let blend = boundaries.iter().enumerate().find_map(|(i, &b)| {
+            let into = out_t - (b - dissolve / 2.0);
+            (dissolve > 0.0 && (0.0..dissolve).contains(&into)).then_some((i, into / dissolve))
+        });
+        match blend {
+            None => {
+                let k = segments
+                    .partition_point(|s| s.start <= src_t)
+                    .saturating_sub(1);
+                compose(&mut segments[k], out_t, src_t, &mut cropper, &mut out)?;
             }
-            (Framing::Prefitted, Some(draw)) => {
-                check_size(frame, settings.size)?;
-                out.data.copy_from_slice(&frame.data);
-                draw(&mut out, out_t, src_t)?;
-                sink.write(&out)?;
-            }
-            (Framing::Camera(camera), draw) => {
-                cropper.crop_into(frame, camera.rect_at(out_t), &mut out)?;
-                if let Some(draw) = draw {
-                    draw(&mut out, out_t, src_t)?;
-                }
-                sink.write(&out)?;
+            Some((i, u)) => {
+                let boundary = segments[i + 1].start;
+                compose(&mut segments[i], out_t, src_t, &mut cropper, &mut out)?;
+                compose(
+                    &mut segments[i + 1],
+                    out_t,
+                    src_t.max(boundary),
+                    &mut cropper,
+                    &mut incoming,
+                )?;
+                mix(&mut out, &incoming, ease_in_out_cubic(u));
             }
         }
+        sink.write(&out)?;
         progress(n + 1, total);
     }
     Ok(total)
+}
+
+fn compose(
+    seg: &mut Segment,
+    out_t: f64,
+    src_t: f64,
+    cropper: &mut Cropper,
+    out: &mut Frame,
+) -> Result<()> {
+    let frame = seg.source.advance_to((src_t - seg.start).max(0.0))?;
+    match &seg.framing {
+        Framing::Prefitted => {
+            check_size(frame, (out.width, out.height))?;
+            out.data.copy_from_slice(&frame.data);
+        }
+        Framing::Camera(camera) => cropper.crop_into(frame, camera.rect_at(out_t), out)?,
+    }
+    if let Some(draw) = seg.overlay.as_mut() {
+        draw(out, out_t, src_t)?;
+    }
+    Ok(())
+}
+
+/// `a` becomes `a * (1 - k) + b * k`.
+fn mix(a: &mut Frame, b: &Frame, k: f64) {
+    let k = (k.clamp(0.0, 1.0) * 256.0) as u32;
+    for (x, &y) in a.data.iter_mut().zip(&b.data) {
+        *x = ((*x as u32 * (256 - k) + y as u32 * k) >> 8) as u8;
+    }
 }
 
 fn check_size(frame: &Frame, size: (u32, u32)) -> Result<()> {
@@ -127,6 +196,50 @@ mod tests {
         let first = (start * FPS as f64).ceil() as usize;
         let run: Vec<u64> = indices[first..first + 30].to_vec();
         assert!(run.windows(2).all(|w| w[1] == w[0] + 1), "{run:?}");
+    }
+
+    #[test]
+    fn a_boundary_dissolves_from_one_segment_to_the_next() {
+        let timeline = Timeline::build(&[0.0, 1.0, 2.0, 3.0, 4.0], 4.0, &PacingConfig::default());
+        let mut a = SyntheticSource::new((8, 4), FPS as f64, 150).filled(0);
+        let mut b = SyntheticSource::new((8, 4), FPS as f64, 150).filled(200);
+        let mut sink = RecordingSink::default();
+        let mut segments = [
+            Segment {
+                source: &mut a,
+                framing: Framing::Prefitted,
+                overlay: None,
+                start: 0.0,
+            },
+            Segment {
+                source: &mut b,
+                framing: Framing::Prefitted,
+                overlay: None,
+                start: 2.0,
+            },
+        ];
+        render_segments(
+            &mut segments,
+            &mut sink,
+            &timeline,
+            0.4,
+            RenderSettings {
+                size: (8, 4),
+                fps: FPS,
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+        let at = |t: f64| sink.fills[(timeline.out_time_at(t) * FPS as f64) as usize];
+        assert_eq!(at(1.0), 0);
+        assert_eq!(at(3.0), 200);
+        let mid = at(2.0);
+        assert!((60..=140).contains(&mid), "{mid}");
+        let series: Vec<u8> = sink.fills.clone();
+        assert!(
+            series.windows(2).all(|w| w[1] >= w[0]),
+            "dissolve should only rise"
+        );
     }
 
     #[test]

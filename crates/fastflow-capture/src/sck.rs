@@ -245,7 +245,7 @@ impl ScreenCapture for SckCapture {
             can_exclude_windows: true,
             can_deliver_frames: false,
             reports_frame_timestamps: true,
-            can_follow_displays: false,
+            can_follow_displays: true,
             max_fps: 60,
         }
     }

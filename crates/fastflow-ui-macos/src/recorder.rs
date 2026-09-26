@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use fastflow_capture::{CaptureSession, CaptureSpec};
+use fastflow_capture::{CaptureSession, CaptureSpec, ScreenCapture};
 use fastflow_core::camera::Geometry;
 use fastflow_core::config::{CameraConfig, Config};
 use fastflow_core::geom::{Point, Rect};
@@ -25,20 +25,52 @@ use crate::applog::log;
 
 const FPS: u32 = 60;
 const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
+/// A cursor crossing a display edge on its way somewhere else must not start a segment.
+const DISPLAY_COMMIT: Duration = Duration::from_secs(1);
+/// A new stream that has not delivered a frame by then is abandoned and the old one kept.
+const SWITCH_TIMEOUT: Duration = Duration::from_secs(3);
+const DISPLAY_CHECK_EVERY: Duration = Duration::from_secs(1);
 
 enum Record {
     Anchor(Instant),
     Input(RawInput),
-    Windows(Instant, Point, Vec<WindowInfo>),
+    Windows(Instant, u32, Point, Vec<WindowInfo>),
+}
+
+/// The surface the sampler normalizes against and the segment its samples belong to.
+#[derive(Clone, Copy)]
+struct Target {
+    segment: u32,
+    surface: Rect,
+}
+
+/// A second capture running alongside the current one until it delivers its first frame.
+struct Switch {
+    capture: Box<dyn CaptureSession>,
+    display: Display,
+    file: String,
+    started: Instant,
+}
+
+pub enum Event {
+    /// Recording moved to another display. The overlay should follow.
+    Switched(OverlayParams),
 }
 
 pub struct Recorder {
     dir: PathBuf,
     meta: Meta,
+    cfg: Config,
+    backend: Box<dyn ScreenCapture>,
+    display: Display,
     capture: Box<dyn CaptureSession>,
+    switch: Option<Switch>,
+    pending: Option<(u32, Instant)>,
+    last_display_check: Instant,
     input: MacInputMonitor,
     records: Sender<Record>,
-    anchored: bool,
+    anchor: Option<Instant>,
+    target: Arc<Mutex<Target>>,
     sampling: Arc<AtomicBool>,
     sampler: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
@@ -81,12 +113,8 @@ impl Recorder {
         let mut backend =
             fastflow_capture::detect(&cfg.capture.backend).map_err(|e| e.to_string())?;
         let file = fastflow_capture::segment_file(backend.name(), 0);
-        if backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay {
-            before_capture(&OverlayParams {
-                display_pt: display.bounds_pt,
-                geo: Geometry::new(&segment(&display, file.clone()), cfg.output.size),
-                camera: cfg.camera.clone(),
-            });
+        if let Some(p) = overlay_params(backend.as_ref(), &cfg, &display, &file) {
+            before_capture(&p);
         }
         let capture = backend
             .start(&CaptureSpec {
@@ -105,7 +133,7 @@ impl Recorder {
             backend: backend.name().into(),
             fps: FPS,
             first_frame: capture.confidence(),
-            segments: vec![segment(&display, file)],
+            segments: vec![segment(0, &display, file, 0)],
             recovered: false,
             truncated_by: None,
             failed: None,
@@ -141,21 +169,32 @@ impl Recorder {
 
         let sampling = Arc::new(AtomicBool::new(true));
         let latest = Arc::new(Mutex::new(None));
+        let target = Arc::new(Mutex::new(Target {
+            segment: 0,
+            surface: display.bounds_pt,
+        }));
         let sampler = {
             let sampling = Arc::clone(&sampling);
             let tx = tx.clone();
             let latest = Arc::clone(&latest);
-            let mut source = MacWindowSource::new(display.bounds_pt);
-            thread::spawn(move || sample_windows(&mut source, &sampling, &tx, &latest))
+            let target = Arc::clone(&target);
+            thread::spawn(move || sample_windows(&target, &sampling, &tx, &latest))
         };
 
         Ok(Recorder {
             dir,
             meta,
+            cfg,
+            backend,
+            display,
             capture,
+            switch: None,
+            pending: None,
+            last_display_check: Instant::now(),
             input,
             records: tx,
-            anchored: false,
+            anchor: None,
+            target,
             sampling,
             sampler: Some(sampler),
             writer: Some(writer),
@@ -163,25 +202,173 @@ impl Recorder {
         })
     }
 
+    fn can_follow(&self) -> bool {
+        self.backend.caps().can_follow_displays
+    }
+
+    /// Switches to a new segment on the current display.
+    pub fn resegment(&mut self) -> Result<(), String> {
+        if !self.can_follow() {
+            return Err(format!(
+                "the {} backend cannot switch segments",
+                self.backend.name()
+            ));
+        }
+        if self.switch.is_some() {
+            return Err("a switch is already in progress".into());
+        }
+        self.begin_switch(self.display);
+        Ok(())
+    }
+
+    /// Starts a capture of `display` alongside the current one.
+    fn begin_switch(&mut self, display: Display) {
+        let index = self.meta.segments.len() as u32;
+        let file = fastflow_capture::segment_file(self.backend.name(), index);
+        let spec = CaptureSpec {
+            display_index: display.index,
+            display_id: display.id,
+            size_px: display.pixels,
+            fps: FPS,
+            out: self.dir.join(&file),
+        };
+        match self.backend.start(&spec) {
+            Ok(capture) => {
+                log(format!("switching to display {} as {file}", display.id));
+                self.switch = Some(Switch {
+                    capture,
+                    display,
+                    file,
+                    started: Instant::now(),
+                });
+            }
+            Err(e) => log(format!("switch to display {}: {e}", display.id)),
+        }
+    }
+
+    /// Retires the old capture once the new one has a frame. That frame is the boundary.
+    fn finish_switch(&mut self) -> Result<Option<Event>, String> {
+        let Some(sw) = &mut self.switch else {
+            return Ok(None);
+        };
+        if let Some(why) = sw.capture.exited() {
+            log(format!("switch abandoned: {why}"));
+            if let Some(sw) = self.switch.take() {
+                let _ = sw.capture.stop();
+                let _ = fs::remove_file(self.dir.join(&sw.file));
+            }
+            return Ok(None);
+        }
+        let Some(boundary) = sw.capture.first_frame_at() else {
+            if sw.started.elapsed() > SWITCH_TIMEOUT {
+                log("switch abandoned: the new display delivered no frame");
+                if let Some(sw) = self.switch.take() {
+                    let _ = sw.capture.stop();
+                    let _ = fs::remove_file(self.dir.join(&sw.file));
+                }
+            }
+            return Ok(None);
+        };
+        let sw = self.switch.take().expect("checked above");
+        let Some(anchor) = self.anchor else {
+            let _ = sw.capture.stop();
+            return Ok(None);
+        };
+        let at = ms_since(anchor, boundary);
+        let old = std::mem::replace(&mut self.capture, sw.capture);
+        if let Err(e) = old.stop() {
+            log(format!("stop previous segment: {e}"));
+        }
+        if let Some(last) = self.meta.segments.last_mut() {
+            last.end_ms = Some(at);
+        }
+        let index = self.meta.segments.len() as u32;
+        self.meta
+            .segments
+            .push(segment(index, &sw.display, sw.file.clone(), at));
+        *self.target.lock().unwrap() = Target {
+            segment: index,
+            surface: sw.display.bounds_pt,
+        };
+        self.display = sw.display;
+        write_json(&self.dir.join("meta.json"), &self.meta)?;
+        log(format!("segment {index} starts at {at}ms"));
+        Ok(
+            overlay_params(self.backend.as_ref(), &self.cfg, &self.display, &sw.file)
+                .map(Event::Switched),
+        )
+    }
+
+    /// Follows the cursor to another display after `DISPLAY_COMMIT`. Also reacts to the captured
+    /// display changing size or going away. A backend that cannot follow ends the recording.
+    fn watch_displays(&mut self) -> Result<(), String> {
+        if self.switch.is_some() {
+            return Ok(());
+        }
+        if self.last_display_check.elapsed() >= DISPLAY_CHECK_EVERY {
+            self.last_display_check = Instant::now();
+            let now = display::active()
+                .into_iter()
+                .find(|d| d.id == self.display.id);
+            let changed = match now {
+                None => true,
+                Some(d) => d.pixels != self.display.pixels || d.bounds_pt != self.display.bounds_pt,
+            };
+            if changed {
+                if !self.can_follow() {
+                    self.meta.truncated_by = Some("display_change".into());
+                    return Err("the captured display changed".into());
+                }
+                if let Some(d) = now.or_else(display::under_cursor) {
+                    self.begin_switch(d);
+                }
+                return Ok(());
+            }
+        }
+        if !self.can_follow() {
+            return Ok(());
+        }
+        let Some(under) = display::under_cursor() else {
+            return Ok(());
+        };
+        if under.id == self.display.id {
+            self.pending = None;
+            return Ok(());
+        }
+        match self.pending {
+            Some((id, since)) if id == under.id && since.elapsed() >= DISPLAY_COMMIT => {
+                self.pending = None;
+                self.begin_switch(under);
+            }
+            Some((id, _)) if id == under.id => {}
+            _ => self.pending = Some((under.id, Instant::now())),
+        }
+        Ok(())
+    }
+
     /// The newest window sample, timed from when sampling started.
     pub fn latest_sample(&self) -> Option<WindowSample> {
         self.latest.lock().unwrap().clone()
     }
 
-    /// Call on the main thread every tick. `Err` means the capture died and the recording is over.
-    pub fn tick(&mut self) -> Result<(), String> {
+    /// Call on the main thread every tick. `Err` means the recording is over.
+    pub fn tick(&mut self) -> Result<Option<Event>, String> {
         self.input.maintain();
-        if !self.anchored
+        if self.anchor.is_none()
             && let Some(at) = self.capture.first_frame_at()
         {
-            self.anchored = true;
+            self.anchor = Some(at);
             let _ = self.records.send(Record::Anchor(at));
             log("first frame observed");
         }
-        match self.capture.exited() {
-            Some(why) => Err(why),
-            None => Ok(()),
+        if let Some(why) = self.capture.exited() {
+            return Err(why);
         }
+        let event = self.finish_switch()?;
+        if self.anchor.is_some() {
+            self.watch_displays()?;
+        }
+        Ok(event)
     }
 
     /// Writes a marker into `input.jsonl` at the current moment.
@@ -210,7 +397,11 @@ impl Recorder {
         if let Some(h) = self.sampler.take() {
             let _ = h.join();
         }
-        let anchor = self.capture.first_frame_at();
+        if let Some(sw) = self.switch.take() {
+            let _ = sw.capture.stop();
+            let _ = fs::remove_file(self.dir.join(&sw.file));
+        }
+        let anchor = self.anchor.or_else(|| self.capture.first_frame_at());
         let result = self.capture.stop();
         if let Ok(fastflow_capture::CaptureArtifact {
             frames: Some((written, dropped)),
@@ -225,8 +416,9 @@ impl Recorder {
             let _ = h.join();
         }
 
-        let seg = &mut self.meta.segments[0];
-        seg.end_ms = anchor.map(|a| ms_since(a, end));
+        if let Some(seg) = self.meta.segments.last_mut() {
+            seg.end_ms = anchor.map(|a| ms_since(a, end));
+        }
         self.meta.failed = match (&result, anchor) {
             (Err(e), _) => Some(e.to_string()),
             (Ok(_), None) => Some("no frame was captured".into()),
@@ -260,15 +452,30 @@ fn read_config(dir: &Path) -> Config {
     }
 }
 
-fn segment(d: &Display, file: String) -> SegmentInfo {
+fn overlay_params(
+    backend: &dyn ScreenCapture,
+    cfg: &Config,
+    display: &Display,
+    file: &str,
+) -> Option<OverlayParams> {
+    (backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay).then(
+        || OverlayParams {
+            display_pt: display.bounds_pt,
+            geo: Geometry::new(&segment(0, display, file.to_owned(), 0), cfg.output.size),
+            camera: cfg.camera.clone(),
+        },
+    )
+}
+
+fn segment(index: u32, d: &Display, file: String, start_ms: i64) -> SegmentInfo {
     SegmentInfo {
-        index: 0,
+        index,
         file,
         display_id: d.id,
         surface_px: [d.pixels.0, d.pixels.1],
         surface_pt: [d.bounds_pt.w, d.bounds_pt.h],
         scale: d.scale,
-        start_ms: 0,
+        start_ms,
         end_ms: None,
     }
 }
@@ -294,7 +501,7 @@ fn ms_since(anchor: Instant, at: Instant) -> i64 {
 }
 
 fn sample_windows(
-    source: &mut MacWindowSource,
+    target: &Mutex<Target>,
     running: &AtomicBool,
     tx: &Sender<Record>,
     latest: &Mutex<Option<WindowSample>>,
@@ -303,15 +510,20 @@ fn sample_windows(
     let mut next = started;
     while running.load(Ordering::Relaxed) {
         let at = Instant::now();
+        let Target { segment, surface } = *target.lock().unwrap();
+        let mut source = MacWindowSource::new(surface);
         match (source.cursor(), source.sample()) {
             (Ok(cursor), Ok(windows)) => {
                 *latest.lock().unwrap() = Some(WindowSample {
                     t: at.duration_since(started).as_millis() as i64,
-                    segment: 0,
+                    segment,
                     cursor,
                     windows: windows.clone(),
                 });
-                if tx.send(Record::Windows(at, cursor, windows)).is_err() {
+                if tx
+                    .send(Record::Windows(at, segment, cursor, windows))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -345,14 +557,14 @@ fn write_sidecars(dir: &Path, rx: Receiver<Record>) {
                 writeln!(input, "{line}")?;
                 input.flush()
             }
-            Record::Windows(at, cursor, list) => {
+            Record::Windows(at, segment, cursor, list) => {
                 let t = ms_since(anchor, at);
                 if t < 0 {
                     return Ok(());
                 }
                 let sample = WindowSample {
                     t,
-                    segment: 0,
+                    segment,
                     cursor,
                     windows: list,
                 };

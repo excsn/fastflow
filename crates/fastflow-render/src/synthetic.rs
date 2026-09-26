@@ -35,6 +35,14 @@ impl SyntheticSource {
         }
     }
 
+    /// Fills every pixel's colour channels with `value`, leaving the index bytes to be written.
+    pub fn filled(mut self, value: u8) -> Self {
+        for px in self.current.data.as_chunks_mut::<4>().0 {
+            px[..3].fill(value);
+        }
+        self
+    }
+
     pub fn decoded(&self) -> u64 {
         self.next
     }
@@ -86,11 +94,14 @@ impl FrameSource for SyntheticSource {
 #[derive(Default)]
 pub struct RecordingSink {
     pub indices: Vec<u64>,
+    /// The red channel of the last pixel, which the index bytes never touch.
+    pub fills: Vec<u8>,
 }
 
 impl FrameSink for RecordingSink {
     fn write(&mut self, frame: &Frame) -> Result<()> {
         self.indices.push(frame_index(frame));
+        self.fills.push(frame.data[frame.data.len() - 4]);
         Ok(())
     }
 

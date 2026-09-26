@@ -11,11 +11,13 @@ use fastflow_core::markers::Markers;
 use fastflow_core::recording::{InputEvent, Meta, SegmentInfo, WindowSample};
 use fastflow_core::timeline::{SpanKind, Timeline};
 
-use crate::compositor::{self, Framing, RenderSettings};
+use crate::compositor::{self, Framing, RenderSettings, Segment};
 use crate::ffmpeg::{Decode, FfmpegSink, FfmpegSource};
 use crate::focus::{FocusBlur, FocusMask, FocusSettings};
 use crate::overlay::{self, Letterbox};
 use crate::{Frame, FrameSink};
+
+type Draw<'a> = Box<dyn FnMut(&mut Frame, f64, f64) -> crate::Result<()> + 'a>;
 
 pub struct RenderJob {
     pub dir: PathBuf,
@@ -34,14 +36,29 @@ const PREVIEW_FPS: u32 = 30;
 /// Everything the tracks decided for a recording, before any pixels are touched.
 pub struct Plan {
     pub cfg: Config,
-    pub segment: SegmentInfo,
     pub duration: f64,
     pub events: Vec<f64>,
     pub markers: Markers,
     pub timeline: Timeline,
+    pub segments: Vec<SegmentPlan>,
+}
+
+/// One display visit. Each has its own coordinate space, so its own camera track: the camera
+/// resets at a boundary instead of easing across it.
+pub struct SegmentPlan {
+    pub info: SegmentInfo,
+    /// Source seconds at which the segment's file starts.
+    pub start: f64,
     pub geo: Geometry,
     pub samples: Vec<WindowSample>,
     pub track: CameraTrack,
+}
+
+pub fn proxy_file(segment: usize) -> String {
+    match segment {
+        0 => PROXY_FILE.to_owned(),
+        n => format!("proxy.{n}.mp4"),
+    }
 }
 
 /// The proxy's pixel size for a surface: `PROXY_WIDTH` wide, height rounded to even.
@@ -51,19 +68,22 @@ pub fn proxy_size(surface_px: [u32; 2]) -> (u32, u32) {
     (PROXY_WIDTH, h.max(2))
 }
 
-/// Writes `proxy.mp4` next to the raw segment.
+/// Writes a proxy next to each raw segment. Returns the first.
 pub fn make_proxy(dir: &Path) -> Result<PathBuf, String> {
     let meta: Meta = read_json(&dir.join("meta.json"))?;
-    let segment = meta.segments.first().ok_or("meta.json lists no segments")?;
-    let out = dir.join(PROXY_FILE);
-    crate::ffmpeg::transcode_proxy(
-        &dir.join(&segment.file),
-        &out,
-        proxy_size(segment.surface_px),
-        PREVIEW_FPS,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(out)
+    if meta.segments.is_empty() {
+        return Err("meta.json lists no segments".into());
+    }
+    for (i, segment) in meta.segments.iter().enumerate() {
+        crate::ffmpeg::transcode_proxy(
+            &dir.join(&segment.file),
+            &dir.join(proxy_file(i)),
+            proxy_size(segment.surface_px),
+            PREVIEW_FPS,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(dir.join(PROXY_FILE))
 }
 
 #[derive(Debug, Clone)]
@@ -173,17 +193,10 @@ pub fn plan(dir: &Path, log: &mut dyn FnMut(String)) -> Result<Plan, String> {
         .filter(|e| !e.kind.is_marker())
         .map(|e| e.t as f64 / 1000.0)
         .collect();
-    let segment = meta
-        .segments
-        .first()
-        .cloned()
-        .ok_or("meta.json lists no segments")?;
-    if meta.segments.len() > 1 {
-        return Err("multi-segment recordings are not supported yet".into());
-    }
-    let duration = segment
+    let last = meta.segments.last().ok_or("meta.json lists no segments")?;
+    let duration = last
         .end_ms
-        .ok_or("meta.json has no end time for the segment; the recording did not finish")?
+        .ok_or("meta.json has no end time for the last segment; the recording did not finish")?
         as f64
         / 1000.0;
 
@@ -201,29 +214,42 @@ pub fn plan(dir: &Path, log: &mut dyn FnMut(String)) -> Result<Plan, String> {
     }
     summarize(&timeline, duration, events.len(), log);
 
-    let geo = Geometry::new(&segment, cfg.output.size);
-    let samples = read_windows(&dir.join("windows.jsonl"))?;
-    let track = if cfg.camera.enabled {
-        CameraTrack::build(&samples, &timeline, &geo, &cfg.camera, &markers.frame)
-    } else {
-        CameraTrack::fixed(&geo)
-    };
-    log(format!(
-        "camera: {}, {} moves from {} window samples",
-        if cfg.camera.enabled { "on" } else { "off" },
-        track.move_count(),
-        samples.len()
-    ));
+    let all_samples = read_windows(&dir.join("windows.jsonl"))?;
+    let mut segments = Vec::with_capacity(meta.segments.len());
+    for (i, info) in meta.segments.into_iter().enumerate() {
+        let geo = Geometry::new(&info, cfg.output.size);
+        let samples: Vec<WindowSample> = all_samples
+            .iter()
+            .filter(|s| s.segment as usize == i)
+            .cloned()
+            .collect();
+        let track = if cfg.camera.enabled {
+            CameraTrack::build(&samples, &timeline, &geo, &cfg.camera, &markers.frame)
+        } else {
+            CameraTrack::fixed(&geo)
+        };
+        log(format!(
+            "segment {i} ({}): camera {}, {} moves from {} window samples",
+            info.file,
+            if cfg.camera.enabled { "on" } else { "off" },
+            track.move_count(),
+            samples.len()
+        ));
+        segments.push(SegmentPlan {
+            start: info.start_ms as f64 / 1000.0,
+            info,
+            geo,
+            samples,
+            track,
+        });
+    }
     Ok(Plan {
         cfg,
-        segment,
         duration,
         events,
         markers,
         timeline,
-        geo,
-        samples,
-        track,
+        segments,
     })
 }
 
@@ -237,46 +263,135 @@ pub fn run(
     let (dir, out) = (job.dir.as_path(), job.out.as_path());
     let Plan {
         cfg,
-        segment,
         markers,
         timeline,
-        geo,
-        samples,
-        track,
+        segments: plans,
         ..
     } = plan(dir, log)?;
 
-    let (source, segment, size, fps) = if job.preview {
-        let proxy = dir.join(PROXY_FILE);
-        if !proxy.is_file() {
-            return Err(format!("{} has no {PROXY_FILE} yet", dir.display()));
-        }
-        let (w, h) = proxy_size(segment.surface_px);
-        let decoded = SegmentInfo {
-            surface_px: [w, h],
-            ..segment
-        };
-        let size = (cfg.output.size[0] / 2, cfg.output.size[1] / 2);
-        (proxy, decoded, size, PREVIEW_FPS)
-    } else {
-        let file = dir.join(&segment.file);
+    let (size, fps) = if job.preview {
         (
-            file,
-            segment,
-            (cfg.output.size[0], cfg.output.size[1]),
-            cfg.output.fps,
+            (cfg.output.size[0] / 2, cfg.output.size[1] / 2),
+            PREVIEW_FPS,
         )
+    } else {
+        ((cfg.output.size[0], cfg.output.size[1]), cfg.output.fps)
     };
     let px_scale = size.0 as f64 / cfg.output.size[0] as f64;
     let cropping = cfg.camera.enabled && !job.boxes;
-    let decode = if cropping {
-        Decode::Native
-    } else {
-        Decode::Fit(size.0, size.1)
+    let focus_settings = FocusSettings {
+        blur: cfg.focus.blur * px_scale,
+        dim: cfg.focus.dim,
+        feather: cfg.focus.feather * px_scale,
     };
-    let letterbox = Letterbox::new((segment.surface_px[0], segment.surface_px[1]), size);
-    let mut src =
-        FfmpegSource::open(&source, segment, decode, fps as f64).map_err(|e| e.to_string())?;
+
+    let mut sources = Vec::with_capacity(plans.len());
+    for (i, p) in plans.iter().enumerate() {
+        let (file, decoded) = if job.preview {
+            let proxy = dir.join(proxy_file(i));
+            if !proxy.is_file() {
+                return Err(format!("{} has no {} yet", dir.display(), proxy_file(i)));
+            }
+            let (w, h) = proxy_size(p.info.surface_px);
+            let decoded = SegmentInfo {
+                surface_px: [w, h],
+                ..p.info.clone()
+            };
+            (proxy, decoded)
+        } else {
+            (dir.join(&p.info.file), p.info.clone())
+        };
+        let decode = if cropping {
+            Decode::Native
+        } else {
+            Decode::Fit(size.0, size.1)
+        };
+        sources.push(
+            FfmpegSource::open(&file, decoded, decode, fps as f64).map_err(|e| e.to_string())?,
+        );
+    }
+
+    let mut draws: Vec<Draw<'_>> = plans
+        .iter()
+        .map(|p| {
+            let letterbox = Letterbox::new((p.info.surface_px[0], p.info.surface_px[1]), size);
+            let to_output = move |r: &Rect, out_t: f64| -> Rect {
+                if !cropping {
+                    return letterbox.rect(r);
+                }
+                let cam = p.track.rect_at(out_t);
+                Rect {
+                    x: (r.x - cam.x) / cam.w * size.0 as f64,
+                    y: (r.y - cam.y) / cam.h * size.1 as f64,
+                    w: r.w / cam.w * size.0 as f64,
+                    h: r.h / cam.h * size.1 as f64,
+                }
+            };
+            let corner = cfg.focus.corner_radius / p.geo.surface_pt.0;
+            let mut focus = FocusBlur::default();
+            let (cfg, focus_settings, boxes) = (&cfg, focus_settings, job.boxes);
+            Box::new(move |frame: &mut Frame, out_t: f64, src_t: f64| {
+                if cfg.focus.enabled && p.track.focused_at(out_t) {
+                    let ms = (src_t * 1000.0) as i64;
+                    let corner_px = to_output(
+                        &Rect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: corner,
+                            h: 0.0,
+                        },
+                        out_t,
+                    )
+                    .w
+                    .abs();
+                    let masks: Vec<FocusMask> = p
+                        .track
+                        .focus_at(out_t)
+                        .into_iter()
+                        .filter_map(|(id, weight)| {
+                            let r = camera::window_rect_at(&p.samples, id, ms)?;
+                            Some(FocusMask {
+                                rect: to_output(&r, out_t),
+                                corner: corner_px,
+                                weight,
+                            })
+                        })
+                        .collect();
+                    focus.apply(frame, &masks, &focus_settings)?;
+                }
+                if boxes {
+                    draw_boxes(
+                        frame,
+                        &p.samples,
+                        src_t,
+                        p.track.rect_at(out_t),
+                        &p.geo,
+                        cfg,
+                        &letterbox,
+                    );
+                }
+                Ok(())
+            }) as Draw<'_>
+        })
+        .collect();
+    let drawing = cfg.focus.enabled || job.boxes;
+
+    let mut segments: Vec<Segment> = sources
+        .iter_mut()
+        .zip(draws.iter_mut())
+        .zip(&plans)
+        .map(|((source, draw), p)| Segment {
+            source,
+            framing: if cropping {
+                Framing::Camera(&p.track)
+            } else {
+                Framing::Prefitted
+            },
+            overlay: drawing.then_some(draw.as_mut() as compositor::Overlay),
+            start: p.start,
+        })
+        .collect();
+
     let chapters_file = out.with_extension("chapters.txt");
     let chapters = if markers.chapters.is_empty() {
         None
@@ -296,83 +411,12 @@ pub fn run(
     let mut sink =
         Box::new(FfmpegSink::create(out, size, fps, chapters).map_err(|e| e.to_string())?);
 
-    let framing = if cropping {
-        Framing::Camera(&track)
-    } else {
-        Framing::Prefitted
-    };
-    let to_output = |r: &Rect, out_t: f64| -> Rect {
-        if !cropping {
-            return letterbox.rect(r);
-        }
-        let cam = track.rect_at(out_t);
-        Rect {
-            x: (r.x - cam.x) / cam.w * size.0 as f64,
-            y: (r.y - cam.y) / cam.h * size.1 as f64,
-            w: r.w / cam.w * size.0 as f64,
-            h: r.h / cam.h * size.1 as f64,
-        }
-    };
-    let focus_settings = FocusSettings {
-        blur: cfg.focus.blur * px_scale,
-        dim: cfg.focus.dim,
-        feather: cfg.focus.feather * px_scale,
-    };
-    let corner = cfg.focus.corner_radius / geo.surface_pt.0;
-    let mut focus = FocusBlur::default();
-    let mut draw = |frame: &mut Frame, out_t: f64, src_t: f64| {
-        if cfg.focus.enabled {
-            let ms = (src_t * 1000.0) as i64;
-            let masks: Vec<FocusMask> = track
-                .focus_at(out_t)
-                .into_iter()
-                .filter_map(|(id, weight)| {
-                    let r = camera::window_rect_at(&samples, id, ms)?;
-                    let corner = to_output(
-                        &Rect {
-                            x: 0.0,
-                            y: 0.0,
-                            w: corner,
-                            h: 0.0,
-                        },
-                        out_t,
-                    )
-                    .w;
-                    Some(FocusMask {
-                        rect: to_output(&r, out_t),
-                        corner: corner.abs(),
-                        weight,
-                    })
-                })
-                .collect();
-            focus.apply(frame, &masks, &focus_settings)?;
-        }
-        if job.boxes {
-            draw_boxes(
-                frame,
-                &samples,
-                src_t,
-                track.rect_at(out_t),
-                &geo,
-                &cfg,
-                &letterbox,
-            );
-        }
-        Ok(())
-    };
-    let overlay: Option<compositor::Overlay> = if cfg.focus.enabled || job.boxes {
-        Some(&mut draw)
-    } else {
-        None
-    };
-
     let started = Instant::now();
-    let frames = compositor::render(
-        &mut src,
+    let frames = compositor::render_segments(
+        &mut segments,
         sink.as_mut(),
         &timeline,
-        framing,
-        overlay,
+        cfg.render.switch_ms as f64 / 1000.0,
         RenderSettings { size, fps },
         progress,
     )

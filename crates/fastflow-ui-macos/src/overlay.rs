@@ -137,7 +137,8 @@ impl Overlay {
                 Some(Decision::Adopt { rect, .. }) => {
                     self.rect = self.geo.frame(rect, &self.cfg);
                 }
-                Some(Decision::Commit { rect, .. }) => {
+                Some(Decision::OverviewStart { .. }) => {}
+                Some(Decision::Commit { rect, .. } | Decision::OverviewEnd { rect, .. }) => {
                     let from = self.current(now);
                     self.active = camera::plan_move(now, from, rect, &self.geo, &self.cfg);
                     if self.active.is_none() {
