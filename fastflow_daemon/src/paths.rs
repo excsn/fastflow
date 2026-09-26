@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use crate::protocol::RecordingEntry;
 
-pub const BUNDLE_ID: &str = "com.novenseri.fastflow";
+pub const BUNDLE_ID: &str = "com.excsn.mac.fastflow";
 
 fn home() -> PathBuf {
   std::env::var_os("HOME")

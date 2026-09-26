@@ -6,15 +6,15 @@ fastflow captures once and edits afterwards. A recording is the untouched screen
 
 | crate | holds |
 |---|---|
-| `fastflow-core` | the domain model: recording format, config, timeline, camera director and track, markers, diagram. No I/O, no platform calls |
-| `fastflow-capture` | the `ScreenCapture` trait and its backends: ScreenCaptureKit with `AVAssetWriter` plus an ffmpeg child process |
-| `fastflow-desktop` | window sampling, the input event tap, display lookup and permission checks |
-| `fastflow-render` | frame sources and sinks, the compositor, crop, focus blur, proxies and the render job |
-| `fastflow-daemon` | the socket protocol, server, render queue, retention sweep and standard paths |
-| `fastflow-cli` | the `fastflow` command: socket client plus local render, preview and diagram |
-| `fastflow-ui-macos` | the menu bar app: tray, setup window, recorder, live overlay, hotkeys, notifications, crash recovery |
+| `fastflow_core` | the domain model: recording format, config, timeline, camera director and track, markers, diagram. No I/O, no platform calls |
+| `fastflow_capture` | the `ScreenCapture` trait and its backends: ScreenCaptureKit with `AVAssetWriter` plus an ffmpeg child process |
+| `fastflow_desktop` | window sampling, the input event tap, display lookup and permission checks |
+| `fastflow_render` | frame sources and sinks, the compositor, crop, focus blur, proxies and the render job |
+| `fastflow_daemon` | the socket protocol, server, render queue, retention sweep and standard paths |
+| `fastflow_cli` | the `fastflow` command: socket client plus local render, preview and diagram |
+| `fastflow_ui_macos` | the menu bar app: tray, setup window, recorder, live overlay, hotkeys, notifications, crash recovery |
 
-`fastflow-core` depends on nothing platform-specific. `fastflow-daemon` takes the render as an injected function, so it depends on no backend. `fastflow-ui-macos` is the only crate that knows about the app bundle.
+`fastflow_core` depends on nothing platform-specific. `fastflow_daemon` takes the render as an injected function, so it depends on no backend. `fastflow_ui_macos` is the only crate that knows about the app bundle.
 
 ## Recording
 
@@ -35,7 +35,7 @@ Two contracts hold across every backend:
 - **One clock.** Every `t` is milliseconds since the first captured frame. ScreenCaptureKit reports host-clock timestamps, the clock `Instant` reads, so the anchor is exact. The ffmpeg backend estimates it and runs about 180ms late.
 - **Normalized coordinates.** Window, cursor and camera rects are fractions of the segment's captured surface. Pixels appear in exactly one place, the compositor's crop.
 
-The recorder in `fastflow-ui-macos/src/recorder.rs` runs the capture session, a listen-only event tap on the main run loop and a sampler thread. A writer thread holds records until the first frame is known, then writes each jsonl line and flushes it. When the cursor settles on another display for 1s it starts a second capture there and retires the first once the new one delivers a frame, which becomes the segment boundary.
+The recorder in `fastflow_ui_macos/src/recorder.rs` runs the capture session, a listen-only event tap on the main run loop and a sampler thread. A writer thread holds records until the first frame is known, then writes each jsonl line and flushes it. When the cursor settles on another display for 1s it starts a second capture there and retires the first once the new one delivers a frame, which becomes the segment boundary.
 
 ## Rendering
 
@@ -50,7 +50,7 @@ The live overlay feeds the same `Director` and `plan_move` in wall-clock time, s
 
 ## The app
 
-The tray, the socket and hotkeys all end up on the main thread through the winit event loop, where the recorder lives. Renders run one at a time on the queue's worker thread. The socket is `~/Library/Application Support/com.novenseri.fastflow/sock`, newline-delimited json. At launch the app recovers recordings a dead instance left behind and sweeps raw footage kept 7 days past its render. It opens the setup window if a grant is missing.
+The tray, the socket and hotkeys all end up on the main thread through the winit event loop, where the recorder lives. Renders run one at a time on the queue's worker thread. The socket is `~/Library/Application Support/com.excsn.mac.fastflow/sock`, newline-delimited json. At launch the app recovers recordings a dead instance left behind and sweeps raw footage kept 7 days past its render. It opens the setup window if a grant is missing.
 
 ## Testing
 

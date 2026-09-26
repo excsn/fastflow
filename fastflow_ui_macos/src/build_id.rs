@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 fn marker() -> Option<PathBuf> {
   let home = std::env::var_os("HOME")?;
-  Some(PathBuf::from(home).join("Library/Application Support/com.novenseri.fastflow/granted-build"))
+  Some(PathBuf::from(home).join("Library/Application Support/com.excsn.mac.fastflow/granted-build"))
 }
 
 /// FNV-1a over the executable. An ad-hoc signature changes exactly when these bytes do.

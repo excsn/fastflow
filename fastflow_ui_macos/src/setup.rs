@@ -15,7 +15,7 @@ use objc2_foundation::{
 
 use crate::applog::log;
 
-pub const BUNDLE_ID: &str = "com.novenseri.fastflow";
+pub const BUNDLE_ID: &str = "com.excsn.mac.fastflow";
 
 const WIDTH: f64 = 460.0;
 const INSET: f64 = 20.0;

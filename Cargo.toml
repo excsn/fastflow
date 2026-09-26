@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["fastflow-*"]
+members = ["fastflow_*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,14 +11,14 @@ license = "MPL-2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 core-foundation = "0.10"
 core-graphics = "0.25"
-fastflow-capture = { path = "fastflow-capture" }
-fastflow-core = { path = "fastflow-core" }
-fastflow-daemon = { path = "fastflow-daemon" }
-fastflow-desktop = { path = "fastflow-desktop" }
+fastflow_capture = { path = "fastflow_capture" }
+fastflow_core = { path = "fastflow_core" }
+fastflow_daemon = { path = "fastflow_daemon" }
+fastflow_desktop = { path = "fastflow_desktop" }
 fast_image_resize = "6"
 global-hotkey = "0.8"
 libc = "0.2"
-fastflow-render = { path = "fastflow-render" }
+fastflow_render = { path = "fastflow_render" }
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
@@ -29,6 +29,7 @@ objc2-av-kit = "0.3"
 objc2-core-graphics = "0.3"
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
+png = "0.18"
 dispatch2 = "0.3"
 block2 = "0.6"
 serde = { version = "1", features = ["derive"] }

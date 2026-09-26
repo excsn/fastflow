@@ -1,12 +1,10 @@
 [package]
-name = "fastflow-core"
+name = "fastflow_daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
-proptest.workspace = true
 serde_json.workspace = true

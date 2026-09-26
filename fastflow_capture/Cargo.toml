@@ -1,11 +1,11 @@
 [package]
-name = "fastflow-capture"
+name = "fastflow_capture"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-fastflow-core.workspace = true
+fastflow_core.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2.workspace = true

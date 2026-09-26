@@ -17,8 +17,8 @@ fastflow is built from source on the Mac that runs it. It needs macOS 12.3 or la
 ```sh
 brew install ffmpeg
 git clone <repo> fastflow && cd fastflow
-fastflow-ui-macos/bundle/bundle.sh --install      # builds, signs ad-hoc, installs /Applications/fastflow.app
-cargo install --path fastflow-cli                 # the fastflow command
+fastflow_ui_macos/bundle/bundle.sh --install      # builds, signs ad-hoc, installs /Applications/fastflow.app
+cargo install --path fastflow_cli                 # the fastflow command
 open /Applications/fastflow.app
 ```
 

@@ -304,7 +304,7 @@ impl ScreenCapture for SckCapture {
         Some(delegate),
       )
     };
-    let queue = DispatchQueue::new("com.novenseri.fastflow.capture", None);
+    let queue = DispatchQueue::new("com.excsn.mac.fastflow.capture", None);
     unsafe {
       stream.addStreamOutput_type_sampleHandlerQueue_error(
         ProtocolObject::from_ref(&*output),

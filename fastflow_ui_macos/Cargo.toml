@@ -1,5 +1,5 @@
 [package]
-name = "fastflow-ui-macos"
+name = "fastflow_ui_macos"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,12 +10,12 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
-fastflow-capture.workspace = true
-fastflow-core.workspace = true
-fastflow-daemon.workspace = true
-fastflow-render.workspace = true
+fastflow_capture.workspace = true
+fastflow_core.workspace = true
+fastflow_daemon.workspace = true
+fastflow_render.workspace = true
 global-hotkey.workspace = true
-fastflow-desktop.workspace = true
+fastflow_desktop.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-av-foundation.workspace = true
@@ -23,6 +23,7 @@ objc2-av-kit.workspace = true
 objc2-core-media.workspace = true
 objc2-foundation.workspace = true
 objc2-user-notifications.workspace = true
+png.workspace = true
 block2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

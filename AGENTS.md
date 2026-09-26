@@ -10,12 +10,12 @@ cargo test                        # everything runs without ffmpeg, a display or
 cargo clippy --all-targets        # keep it at zero warnings
 cargo fmt
 
-cargo build --release -p fastflow-cli
+cargo build --release -p fastflow_cli
 ./target/release/fastflow render ~/Movies/fastflow/<id>          # render a recording locally
 ./target/release/fastflow diagram <id>                           # what pacing and the camera decided
 ./target/release/fastflow preview <id>                           # half-size render from the proxy
 
-FASTFLOW_SIGN_IDENTITY="<identity>" fastflow-ui-macos/bundle/bundle.sh --install
+FASTFLOW_SIGN_IDENTITY="<identity>" fastflow_ui_macos/bundle/bundle.sh --install
 open /Applications/fastflow.app
 ```
 
@@ -31,7 +31,7 @@ open /Applications/fastflow.app
 
 - **Timestamps.** Every sidecar `t` is milliseconds since the first captured frame, never since start was pressed.
 - **Coordinates.** Rects in the recording and the tracks are normalized to the segment's surface. Only the compositor's crop converts to pixels.
-- **Tracks are pure.** `fastflow-core` does no I/O and calls no platform API. The timeline and camera track are functions of the sidecars and the config.
+- **Tracks are pure.** `fastflow_core` does no I/O and calls no platform API. The timeline and camera track are functions of the sidecars and the config.
 - **The camera works in output time.** Moves are placed with `Timeline::out_time_at`. Building them in source time makes a sped-up span whip the camera around.
 - **One director.** The offline track and the live overlay both use `Director` and `plan_move`. Change them there, never in one caller.
 - **Forward decoding only.** `FrameSource::advance_to` must never be asked to go back. Seeking per frame turns a linear render quadratic.

@@ -105,7 +105,7 @@ Make GIF… turns a stretch of the rendered, raw or preview video into an animat
 
 ## Settings
 
-Each recording has a `config.toml`, copied at record time from `~/Library/Application Support/com.novenseri.fastflow/config.toml` when that exists. Every field has a default, so a file only needs what it changes.
+Each recording has a `config.toml`, copied at record time from `~/Library/Application Support/com.excsn.mac.fastflow/config.toml` when that exists. Every field has a default, so a file only needs what it changes.
 
 ```toml
 [capture]

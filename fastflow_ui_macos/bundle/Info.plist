@@ -3,10 +3,12 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.novenseri.fastflow</string>
+	<string>com.excsn.mac.fastflow</string>
 	<key>CFBundleName</key>
 	<string>fastflow</string>
 	<key>CFBundleDisplayName</key>
+	<string>fastflow</string>
+	<key>CFBundleIconFile</key>
 	<string>fastflow</string>
 	<key>CFBundleExecutable</key>
 	<string>fastflow-app</string>

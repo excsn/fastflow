@@ -507,12 +507,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastflow-capture"
+name = "fastflow_capture"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "dispatch2",
- "fastflow-core",
+ "fastflow_core",
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-graphics",
@@ -523,17 +523,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastflow-cli"
+name = "fastflow_cli"
 version = "0.1.0"
 dependencies = [
- "fastflow-core",
- "fastflow-daemon",
- "fastflow-render",
+ "fastflow_core",
+ "fastflow_daemon",
+ "fastflow_render",
  "serde_json",
 ]
 
 [[package]]
-name = "fastflow-core"
+name = "fastflow_core"
 version = "0.1.0"
 dependencies = [
  "proptest",
@@ -542,7 +542,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastflow-daemon"
+name = "fastflow_daemon"
 version = "0.1.0"
 dependencies = [
  "libc",
@@ -551,36 +551,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "fastflow-desktop"
+name = "fastflow_desktop"
 version = "0.1.0"
 dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
- "fastflow-core",
+ "fastflow_core",
 ]
 
 [[package]]
-name = "fastflow-render"
+name = "fastflow_render"
 version = "0.1.0"
 dependencies = [
  "fast_image_resize",
- "fastflow-core",
+ "fastflow_core",
  "serde",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",
 ]
 
 [[package]]
-name = "fastflow-ui-macos"
+name = "fastflow_ui_macos"
 version = "0.1.0"
 dependencies = [
  "block2 0.6.2",
  "chrono",
- "fastflow-capture",
- "fastflow-core",
- "fastflow-daemon",
- "fastflow-desktop",
- "fastflow-render",
+ "fastflow_capture",
+ "fastflow_core",
+ "fastflow_daemon",
+ "fastflow_desktop",
+ "fastflow_render",
  "global-hotkey",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
@@ -589,6 +589,7 @@ dependencies = [
  "objc2-core-media",
  "objc2-foundation 0.3.2",
  "objc2-user-notifications 0.3.2",
+ "png",
  "serde",
  "serde_json",
  "toml 1.1.6+spec-1.1.0",

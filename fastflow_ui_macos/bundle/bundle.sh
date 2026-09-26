@@ -10,20 +10,21 @@ identity=${FASTFLOW_SIGN_IDENTITY:--}
 
 cd "$root"
 if [ "$profile" = release ]; then
-    cargo build --release -p fastflow-ui-macos
+    cargo build --release -p fastflow_ui_macos
 else
-    cargo build -p fastflow-ui-macos
+    cargo build -p fastflow_ui_macos
 fi
 
 version=$(cargo metadata --no-deps --format-version 1 \
-    | sed -n 's/.*"name":"fastflow-ui-macos","version":"\([^"]*\)".*/\1/p')
+    | sed -n 's/.*"name":"fastflow_ui_macos","version":"\([^"]*\)".*/\1/p')
 
 app="$root/target/$profile/fastflow.app"
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$here/fastflow.icns" "$app/Contents/Resources/fastflow.icns"
 sed "s/@VERSION@/$version/g" "$here/Info.plist" > "$app/Contents/Info.plist"
 cp "$root/target/$profile/fastflow-app" "$app/Contents/MacOS/fastflow-app"
-codesign --force --sign "$identity" --identifier com.novenseri.fastflow "$app"
+codesign --force --sign "$identity" --identifier com.excsn.mac.fastflow "$app"
 codesign --verify --verbose=1 "$app"
 
 if [ "${1:-}" = --install ]; then
