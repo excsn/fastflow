@@ -12,6 +12,7 @@ use fastflow_core::geom::Point;
 use fastflow_core::recording::{
     FORMAT_VERSION, InputEvent, Meta, SegmentInfo, WindowInfo, WindowSample,
 };
+use fastflow_daemon::paths;
 use fastflow_desktop::macos::display::{self, Display};
 use fastflow_desktop::macos::input::MacInputMonitor;
 use fastflow_desktop::macos::window::MacWindowSource;
@@ -52,8 +53,13 @@ impl Recorder {
     pub fn start() -> Result<Self, String> {
         let display = display::under_cursor().ok_or("no active display")?;
         let started = chrono::Local::now();
-        let dir = recordings_root()?.join(started.format("%Y-%m-%d-%H%M%S").to_string());
+        let dir = paths::recordings().join(started.format("%Y-%m-%d-%H%M%S").to_string());
         fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        if paths::default_config().is_file()
+            && let Err(e) = fs::copy(paths::default_config(), dir.join("config.toml"))
+        {
+            log(format!("copy default config: {e}"));
+        }
         log(format!(
             "recording to {} on display {display:?}",
             dir.display()
@@ -145,7 +151,12 @@ impl Recorder {
         }
     }
 
-    pub fn stop(mut self) -> PathBuf {
+    pub fn id(&self) -> String {
+        recording_id(&self.dir)
+    }
+
+    /// `Ok` holds the recording's id. `Err` holds why it failed.
+    pub fn stop(mut self) -> Result<String, String> {
         let end = Instant::now();
         self.input.stop();
         self.sampling.store(false, Ordering::Relaxed);
@@ -176,7 +187,10 @@ impl Recorder {
             self.meta.failed.as_deref().unwrap_or("ok"),
             self.dir.display()
         ));
-        self.dir
+        match self.meta.failed.take() {
+            Some(why) => Err(why),
+            None => Ok(recording_id(&self.dir)),
+        }
     }
 }
 
@@ -193,9 +207,10 @@ fn segment(d: &Display) -> SegmentInfo {
     }
 }
 
-fn recordings_root() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME unset")?;
-    Ok(PathBuf::from(home).join("Movies/fastflow"))
+fn recording_id(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {

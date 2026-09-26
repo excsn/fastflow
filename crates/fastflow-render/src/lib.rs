@@ -2,6 +2,7 @@ pub mod compositor;
 pub mod crop;
 pub mod ffmpeg;
 pub mod focus;
+pub mod job;
 pub mod overlay;
 pub mod synthetic;
 
