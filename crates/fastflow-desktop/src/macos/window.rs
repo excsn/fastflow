@@ -81,7 +81,7 @@ impl WindowSource for MacWindowSource {
                 )
             };
             let bounds = rect(cg);
-            if !ok || !bounds.intersects(&self.surface) {
+            if !ok || !bounds.intersects(&self.surface) || pid as u32 == std::process::id() {
                 continue;
             }
             out.push(WindowInfo {

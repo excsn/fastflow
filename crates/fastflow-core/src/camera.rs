@@ -133,13 +133,124 @@ pub fn subject<'a>(
     })
 }
 
+/// One eased camera move, in whatever clock `start` is measured in: output time offline,
+/// wall time for the live overlay.
 #[derive(Debug, Clone, PartialEq)]
-struct Move {
+pub struct Move {
     start: f64,
     duration: f64,
     from: Rect,
     control: Rect,
     to: Rect,
+}
+
+/// What the director decided on a sample.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Decision {
+    /// The first subject, taken without a move.
+    Adopt { id: u32, rect: Rect },
+    /// A new subject after the debounce. The same window moving or resizing counts too. `at` is
+    /// when the debounce was satisfied, in the clock the samples were fed in.
+    Commit {
+        previous: u32,
+        id: u32,
+        rect: Rect,
+        at: f64,
+    },
+}
+
+/// Chooses the subject from samples as they arrive. The offline track and the live overlay both
+/// feed it, so they cannot disagree about when the camera commits.
+#[derive(Debug, Clone, Default)]
+pub struct Director {
+    committed: Option<(u32, Rect)>,
+    candidate: Option<(u32, Rect, f64)>,
+}
+
+impl Director {
+    /// `t` is the sample's time in seconds. While `pinned` the committed subject is kept.
+    pub fn feed(
+        &mut self,
+        t: f64,
+        sample: &WindowSample,
+        geo: &Geometry,
+        cfg: &CameraConfig,
+        pinned: bool,
+    ) -> Option<Decision> {
+        if self.committed.is_some() && pinned {
+            self.candidate = None;
+            return None;
+        }
+        let Some(w) = subject(sample, geo, cfg) else {
+            self.candidate = None;
+            return None;
+        };
+        let same_as = |c: &(u32, Rect)| c.0 == w.id && same_rect(&c.1, &w.rect);
+        if self.committed.as_ref().is_some_and(same_as) {
+            self.candidate = None;
+            return None;
+        }
+        let since = match self.candidate {
+            Some((id, r, since)) if id == w.id && same_rect(&r, &w.rect) => since,
+            _ => {
+                self.candidate = Some((w.id, w.rect, t));
+                t
+            }
+        };
+        let Some((previous, _)) = self.committed else {
+            self.committed = Some((w.id, w.rect));
+            self.candidate = None;
+            return Some(Decision::Adopt {
+                id: w.id,
+                rect: w.rect,
+            });
+        };
+        let commit = cfg.commit_ms as f64 / 1000.0;
+        if t - since < commit {
+            return None;
+        }
+        self.committed = Some((w.id, w.rect));
+        self.candidate = None;
+        Some(Decision::Commit {
+            previous,
+            id: w.id,
+            rect: w.rect,
+            at: since + commit,
+        })
+    }
+}
+
+/// The move from the current camera rect to frame `window`. `None` when the two framings overlap
+/// enough that the camera holds.
+pub fn plan_move(
+    start: f64,
+    from: Rect,
+    window: Rect,
+    geo: &Geometry,
+    cfg: &CameraConfig,
+) -> Option<Move> {
+    let to = geo.frame(window, cfg);
+    if overlap(&to, &from) >= cfg.overlap_hold {
+        return None;
+    }
+    let union = Rect {
+        x: from.x.min(to.x),
+        y: from.y.min(to.y),
+        w: (from.x + from.w).max(to.x + to.w) - from.x.min(to.x),
+        h: (from.y + from.h).max(to.y + to.h) - from.y.min(to.y),
+    };
+    let control = geo.fit_aspect(centred(
+        union,
+        union.w * cfg.pull_back,
+        union.h * cfg.pull_back,
+    ));
+    Some(Move {
+        start,
+        duration: cfg.transition_ms as f64 / 1000.0,
+        from,
+        control,
+        to,
+    })
 }
 
 /// A switch of the focused window, which the render crossfades over `duration`.
@@ -194,7 +305,12 @@ pub fn ease_in_out_cubic(u: f64) -> f64 {
 }
 
 impl Move {
-    fn rect_at(&self, out_t: f64) -> Rect {
+    pub fn end(&self) -> f64 {
+        self.start + self.duration
+    }
+
+    /// Clamped to `start..end`, so before the move it is `from` and after it `to`.
+    pub fn rect_at(&self, out_t: f64) -> Rect {
         let u = ((out_t - self.start) / self.duration).clamp(0.0, 1.0);
         let s = ease_in_out_cubic(u);
         let (a, c, b) = (&self.from, &self.control, &self.to);
@@ -230,81 +346,38 @@ impl CameraTrack {
         pinned: &[Range<f64>],
     ) -> CameraTrack {
         let mut track = CameraTrack::fixed(geo);
-        let commit = cfg.commit_ms as f64 / 1000.0;
         let transition = cfg.transition_ms as f64 / 1000.0;
-
-        let mut committed: Option<(u32, Rect)> = None;
-        let mut candidate: Option<(u32, Rect, f64)> = None;
-
+        let mut director = Director::default();
         for sample in samples {
             let t = sample.t as f64 / 1000.0;
-            if committed.is_some() && pinned.iter().any(|r| r.contains(&t)) {
-                candidate = None;
-                continue;
-            }
-            let Some(w) = subject(sample, geo, cfg) else {
-                candidate = None;
-                continue;
-            };
-            let same_as = |c: &(u32, Rect)| c.0 == w.id && same_rect(&c.1, &w.rect);
-            if committed.as_ref().is_some_and(same_as) {
-                candidate = None;
-                continue;
-            }
-            let since = match candidate {
-                Some((id, r, since)) if id == w.id && same_rect(&r, &w.rect) => since,
-                _ => {
-                    candidate = Some((w.id, w.rect, t));
-                    t
+            let is_pinned = pinned.iter().any(|r| r.contains(&t));
+            match director.feed(t, sample, geo, cfg, is_pinned) {
+                None => {}
+                Some(Decision::Adopt { id, rect }) => {
+                    track.initial = geo.frame(rect, cfg);
+                    track.initial_focus = Some(id);
                 }
-            };
-
-            let Some((previous, _)) = committed else {
-                track.initial = geo.frame(w.rect, cfg);
-                track.initial_focus = Some(w.id);
-                committed = Some((w.id, w.rect));
-                candidate = None;
-                continue;
-            };
-            if t - since < commit {
-                continue;
+                Some(Decision::Commit {
+                    previous,
+                    id,
+                    rect,
+                    at,
+                }) => {
+                    let at = timeline.out_time_at(at);
+                    if previous != id {
+                        track.focus.push(FocusChange {
+                            start: at,
+                            duration: transition,
+                            from: Some(previous),
+                            to: id,
+                        });
+                    }
+                    if let Some(m) = plan_move(at, track.rect_at(at), rect, geo, cfg) {
+                        track.moves.retain(|m| m.start < at);
+                        track.moves.push(m);
+                    }
+                }
             }
-
-            committed = Some((w.id, w.rect));
-            candidate = None;
-            let at = timeline.out_time_at(since + commit);
-            if previous != w.id {
-                track.focus.push(FocusChange {
-                    start: at,
-                    duration: transition,
-                    from: Some(previous),
-                    to: w.id,
-                });
-            }
-            let from = track.rect_at(at);
-            let to = geo.frame(w.rect, cfg);
-            if overlap(&to, &from) >= cfg.overlap_hold {
-                continue;
-            }
-            let union = Rect {
-                x: from.x.min(to.x),
-                y: from.y.min(to.y),
-                w: (from.x + from.w).max(to.x + to.w) - from.x.min(to.x),
-                h: (from.y + from.h).max(to.y + to.h) - from.y.min(to.y),
-            };
-            let control = geo.fit_aspect(centred(
-                union,
-                union.w * cfg.pull_back,
-                union.h * cfg.pull_back,
-            ));
-            track.moves.retain(|m| m.start < at);
-            track.moves.push(Move {
-                start: at,
-                duration: transition,
-                from,
-                control,
-                to,
-            });
         }
         track
     }

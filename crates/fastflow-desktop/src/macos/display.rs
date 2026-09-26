@@ -65,3 +65,8 @@ pub fn under_cursor() -> Option<Display> {
         .or(displays.first())
         .copied()
 }
+
+/// Height of the primary display in points. AppKit window frames count y up from its bottom.
+pub fn primary_height() -> f64 {
+    CGDisplay::main().bounds().size.height
+}

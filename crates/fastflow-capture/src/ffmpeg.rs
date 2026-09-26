@@ -239,6 +239,7 @@ impl CaptureSession for FfmpegSession {
         Ok(CaptureArtifact {
             path: self.out.clone(),
             status,
+            frames: None,
         })
     }
 }

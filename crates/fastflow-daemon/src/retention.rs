@@ -23,7 +23,7 @@ pub struct Swept {
 }
 
 fn is_raw(name: &str) -> bool {
-    name.starts_with("raw.") && name.ends_with(".mp4")
+    name.starts_with("raw.") && (name.ends_with(".mp4") || name.ends_with(".mov"))
 }
 
 /// Deletes the raw segments of every recording whose render is older than `keep`. Recordings

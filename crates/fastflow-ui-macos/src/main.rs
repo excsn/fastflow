@@ -1,6 +1,7 @@
 mod applog;
 mod build_id;
 mod notify;
+mod overlay;
 mod recorder;
 mod recovery;
 mod setup;
@@ -34,6 +35,7 @@ use winit::window::WindowId;
 
 const PERMISSION_POLL: Duration = Duration::from_secs(2);
 const RECORDING_TICK: Duration = Duration::from_millis(100);
+const OVERLAY_TICK: Duration = Duration::from_millis(16);
 const RENDERING_TICK: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SWEEP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -134,6 +136,7 @@ struct App {
     last_sweep: Option<Instant>,
     last_disk_check: Option<Instant>,
     hotkeys: Option<Hotkeys>,
+    overlay: Option<overlay::Overlay>,
 }
 
 impl App {
@@ -326,6 +329,16 @@ impl App {
         }
         let r = Recorder::start()?;
         let id = r.id();
+        if let Some(p) = r.overlay_params() {
+            let mtm = MainThreadMarker::new().expect("main thread");
+            self.overlay = Some(overlay::Overlay::new(
+                mtm,
+                p.display_pt,
+                fastflow_desktop::macos::display::primary_height(),
+                p.geo,
+                p.camera,
+            ));
+        }
         self.recorder = Some(r);
         self.show_recording_state();
         Ok(id)
@@ -334,6 +347,9 @@ impl App {
     /// A recording that stopped cleanly is queued for rendering straight away.
     fn stop_recording(&mut self) -> Result<String, String> {
         let r = self.recorder.take().ok_or("not recording")?;
+        if let Some(o) = self.overlay.take() {
+            o.close();
+        }
         let result = r.stop();
         self.show_recording_state();
         let id = result?;
@@ -480,6 +496,9 @@ impl App {
             self.last_disk_check = Some(Instant::now());
         }
         let Some(r) = &mut self.recorder else { return };
+        if let Some(o) = &mut self.overlay {
+            o.update(r.latest_sample().as_ref());
+        }
         if low {
             log("disk nearly full, stopping the recording");
             r.truncate("disk_full");
@@ -495,6 +514,9 @@ impl App {
         }
         if let Err(why) = r.tick() {
             log(format!("capture ended unexpectedly: {why}"));
+            if let Some(o) = self.overlay.take() {
+                o.close();
+            }
             if let Some(r) = self.recorder.take() {
                 let _ = r.stop();
             }
@@ -548,7 +570,9 @@ impl ApplicationHandler<UserEvent> for App {
             .queue
             .as_ref()
             .is_some_and(|q| q.status().rendering.is_some());
-        let period = if self.recorder.is_some() {
+        let period = if self.overlay.is_some() {
+            OVERLAY_TICK
+        } else if self.recorder.is_some() {
             RECORDING_TICK
         } else if rendering {
             RENDERING_TICK
@@ -615,6 +639,7 @@ fn main() {
         last_sweep: None,
         last_disk_check: None,
         hotkeys: None,
+        overlay: None,
     };
     event_loop.run_app(&mut app).expect("event loop");
 }

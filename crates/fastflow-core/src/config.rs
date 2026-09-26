@@ -48,6 +48,9 @@ pub struct CameraConfig {
     /// Points.
     pub min_window_size: [f64; 2],
     pub overlap_hold: f64,
+    /// Draw the camera's framing on screen while recording, when the capture backend can keep
+    /// it out of the footage.
+    pub live_overlay: bool,
 }
 
 /// Blurs and dims everything outside the window the camera has chosen.
@@ -112,6 +115,7 @@ impl Default for CameraConfig {
             max_zoom: 2.0,
             min_window_size: [300.0, 200.0],
             overlap_hold: 0.85,
+            live_overlay: true,
         }
     }
 }

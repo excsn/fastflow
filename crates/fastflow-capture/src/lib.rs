@@ -1,4 +1,6 @@
 pub mod ffmpeg;
+#[cfg(target_os = "macos")]
+pub mod sck;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -20,6 +22,8 @@ pub struct CaptureCaps {
 pub struct CaptureSpec {
     /// Position of the display in `CGGetActiveDisplayList` order.
     pub display_index: usize,
+    pub display_id: u32,
+    pub size_px: (u32, u32),
     pub fps: u32,
     pub out: PathBuf,
 }
@@ -28,6 +32,8 @@ pub struct CaptureSpec {
 pub struct CaptureArtifact {
     pub path: PathBuf,
     pub status: Option<ExitStatus>,
+    /// Frames written and frames dropped, when the backend counts them.
+    pub frames: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -74,7 +80,22 @@ pub trait CaptureSession: Send {
     fn stop(self: Box<Self>) -> Result<CaptureArtifact>;
 }
 
-/// Prefers a native backend once one exists, then ffmpeg.
-pub fn detect() -> Result<Box<dyn ScreenCapture>> {
-    Ok(Box::new(ffmpeg::FfmpegCapture::locate()?))
+/// `backend` is `capture.backend` from the settings: "auto" prefers the native backend.
+pub fn detect(backend: &str) -> Result<Box<dyn ScreenCapture>> {
+    match backend {
+        "ffmpeg" => Ok(Box::new(ffmpeg::FfmpegCapture::locate()?)),
+        #[cfg(target_os = "macos")]
+        "auto" | "sck" => Ok(Box::new(sck::SckCapture)),
+        other => Err(CaptureError::BackendMissing(format!(
+            "unknown backend {other:?}"
+        ))),
+    }
+}
+
+/// The file name a backend writes a segment to.
+pub fn segment_file(backend: &str, index: u32) -> String {
+    match backend {
+        "ffmpeg" => format!("raw.{index}.mp4"),
+        _ => format!("raw.{index}.mov"),
+    }
 }

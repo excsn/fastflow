@@ -1,14 +1,16 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastflow_capture::{CaptureSession, CaptureSpec};
-use fastflow_core::geom::Point;
+use fastflow_core::camera::Geometry;
+use fastflow_core::config::{CameraConfig, Config};
+use fastflow_core::geom::{Point, Rect};
 use fastflow_core::recording::{
     FORMAT_VERSION, InputEvent, InputKind, Meta, SegmentInfo, WindowInfo, WindowSample,
 };
@@ -23,7 +25,6 @@ use crate::applog::log;
 
 const FPS: u32 = 60;
 const SAMPLE_PERIOD: Duration = Duration::from_millis(100);
-const SEGMENT_FILE: &str = "raw.0.mp4";
 
 enum Record {
     Anchor(Instant),
@@ -41,6 +42,17 @@ pub struct Recorder {
     sampling: Arc<AtomicBool>,
     sampler: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
+    latest: Arc<Mutex<Option<WindowSample>>>,
+    overlay: Option<OverlayParams>,
+}
+
+/// What the live overlay needs, present only when the backend keeps fastflow's own windows out
+/// of the footage.
+#[derive(Clone)]
+pub struct OverlayParams {
+    pub display_pt: Rect,
+    pub geo: Geometry,
+    pub camera: CameraConfig,
 }
 
 #[derive(Serialize)]
@@ -65,14 +77,20 @@ impl Recorder {
             dir.display()
         ));
 
-        let mut backend = fastflow_capture::detect().map_err(|e| e.to_string())?;
+        let cfg = read_config(&dir);
+        let mut backend =
+            fastflow_capture::detect(&cfg.capture.backend).map_err(|e| e.to_string())?;
+        let file = fastflow_capture::segment_file(backend.name(), 0);
         let capture = backend
             .start(&CaptureSpec {
                 display_index: display.index,
+                display_id: display.id,
+                size_px: display.pixels,
                 fps: FPS,
-                out: dir.join(SEGMENT_FILE),
+                out: dir.join(&file),
             })
             .map_err(|e| e.to_string())?;
+        log(format!("capturing with {} to {file}", backend.name()));
 
         let meta = Meta {
             format: FORMAT_VERSION,
@@ -80,7 +98,7 @@ impl Recorder {
             backend: backend.name().into(),
             fps: FPS,
             first_frame: capture.confidence(),
-            segments: vec![segment(&display)],
+            segments: vec![segment(&display, file)],
             recovered: false,
             truncated_by: None,
             failed: None,
@@ -115,12 +133,21 @@ impl Recorder {
         }
 
         let sampling = Arc::new(AtomicBool::new(true));
+        let latest = Arc::new(Mutex::new(None));
         let sampler = {
             let sampling = Arc::clone(&sampling);
             let tx = tx.clone();
+            let latest = Arc::clone(&latest);
             let mut source = MacWindowSource::new(display.bounds_pt);
-            thread::spawn(move || sample_windows(&mut source, &sampling, &tx))
+            thread::spawn(move || sample_windows(&mut source, &sampling, &tx, &latest))
         };
+        let overlay =
+            (backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay)
+                .then(|| OverlayParams {
+                    display_pt: display.bounds_pt,
+                    geo: Geometry::new(&meta.segments[0], cfg.output.size),
+                    camera: cfg.camera.clone(),
+                });
 
         Ok(Recorder {
             dir,
@@ -132,7 +159,18 @@ impl Recorder {
             sampling,
             sampler: Some(sampler),
             writer: Some(writer),
+            latest,
+            overlay,
         })
+    }
+
+    pub fn overlay_params(&self) -> Option<OverlayParams> {
+        self.overlay.clone()
+    }
+
+    /// The newest window sample, timed from when sampling started.
+    pub fn latest_sample(&self) -> Option<WindowSample> {
+        self.latest.lock().unwrap().clone()
     }
 
     /// Call on the main thread every tick. `Err` means the capture died and the recording is over.
@@ -179,6 +217,13 @@ impl Recorder {
         }
         let anchor = self.capture.first_frame_at();
         let result = self.capture.stop();
+        if let Ok(fastflow_capture::CaptureArtifact {
+            frames: Some((written, dropped)),
+            ..
+        }) = &result
+        {
+            log(format!("{written} frames written, {dropped} dropped"));
+        }
 
         drop(self.records);
         if let Some(h) = self.writer.take() {
@@ -208,10 +253,22 @@ impl Recorder {
     }
 }
 
-fn segment(d: &Display) -> SegmentInfo {
+/// The recording's own `config.toml`, copied from the defaults. Defaults when absent or invalid.
+fn read_config(dir: &Path) -> Config {
+    let path = dir.join("config.toml");
+    match fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+            log(format!("{}: {e}", path.display()));
+            Config::default()
+        }),
+        Err(_) => Config::default(),
+    }
+}
+
+fn segment(d: &Display, file: String) -> SegmentInfo {
     SegmentInfo {
         index: 0,
-        file: SEGMENT_FILE.into(),
+        file,
         display_id: d.id,
         surface_px: [d.pixels.0, d.pixels.1],
         surface_pt: [d.bounds_pt.w, d.bounds_pt.h],
@@ -241,12 +298,24 @@ fn ms_since(anchor: Instant, at: Instant) -> i64 {
     }
 }
 
-fn sample_windows(source: &mut MacWindowSource, running: &AtomicBool, tx: &Sender<Record>) {
-    let mut next = Instant::now();
+fn sample_windows(
+    source: &mut MacWindowSource,
+    running: &AtomicBool,
+    tx: &Sender<Record>,
+    latest: &Mutex<Option<WindowSample>>,
+) {
+    let started = Instant::now();
+    let mut next = started;
     while running.load(Ordering::Relaxed) {
         let at = Instant::now();
         match (source.cursor(), source.sample()) {
             (Ok(cursor), Ok(windows)) => {
+                *latest.lock().unwrap() = Some(WindowSample {
+                    t: at.duration_since(started).as_millis() as i64,
+                    segment: 0,
+                    cursor,
+                    windows: windows.clone(),
+                });
                 if tx.send(Record::Windows(at, cursor, windows)).is_err() {
                     return;
                 }
