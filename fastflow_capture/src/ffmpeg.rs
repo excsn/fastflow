@@ -103,6 +103,13 @@ impl ScreenCapture for FfmpegCapture {
       .ok_or(CaptureError::NoSuchDisplay(spec.display_index))?;
     let fps = spec.fps.to_string();
     let input = format!("{device}:none");
+    let (w, h) = spec.size_px;
+    let scale = format!("scale={w}:{h}");
+    let codec: &[&str] = if crate::needs_hevc(spec.size_px) {
+      &["-c:v", "hevc_videotoolbox", "-tag:v", "hvc1"]
+    } else {
+      &["-c:v", "h264_videotoolbox"]
+    };
     let mut child = Command::new(&self.bin)
       .args(["-hide_banner", "-nostats", "-loglevel", "warning"])
       .args([
@@ -114,14 +121,9 @@ impl ScreenCapture for FfmpegCapture {
         &fps,
       ])
       .args(["-i", &input])
-      .args([
-        "-c:v",
-        "h264_videotoolbox",
-        "-q:v",
-        "60",
-        "-pix_fmt",
-        "yuv420p",
-      ])
+      .args(["-vf", &scale])
+      .args(codec)
+      .args(["-q:v", "60", "-pix_fmt", "yuv420p"])
       .args(RECOVERABLE)
       .args(["-progress", "pipe:1", "-stats_period", "0.1", "-y"])
       .arg(&spec.out)

@@ -3,8 +3,8 @@
 //! Frames carry host-clock presentation timestamps, which is the clock `Instant` reads, so the
 //! first-frame anchor is exact rather than estimated.
 
+use fibre::mpsc;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,8 @@ use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::{
   AVAssetWriter, AVAssetWriterInput, AVAssetWriterStatus, AVFileTypeQuickTimeMovie,
   AVMediaTypeVideo, AVVideoAverageBitRateKey, AVVideoCodecKey, AVVideoCodecTypeH264,
-  AVVideoCompressionPropertiesKey, AVVideoExpectedSourceFrameRateKey, AVVideoHeightKey,
-  AVVideoMaxKeyFrameIntervalDurationKey, AVVideoWidthKey,
+  AVVideoCodecTypeHEVC, AVVideoCompressionPropertiesKey, AVVideoExpectedSourceFrameRateKey,
+  AVVideoHeightKey, AVVideoMaxKeyFrameIntervalDurationKey, AVVideoWidthKey,
 };
 use objc2_core_graphics::kCGColorSpaceSRGB;
 use objc2_core_media::{CMClock, CMSampleBuffer, CMTime};
@@ -140,8 +140,8 @@ impl Shared {
 }
 
 /// Runs an API that reports through a completion block and waits for it.
-fn wait<T: Send + 'static>(start: impl FnOnce(mpsc::Sender<T>)) -> Result<T> {
-  let (tx, rx) = mpsc::channel();
+fn wait<T: Send + 'static>(start: impl FnOnce(mpsc::BoundedSyncSender<T>)) -> Result<T> {
+  let (tx, rx) = mpsc::bounded(1);
   start(tx);
   rx.recv_timeout(CALLBACK_TIMEOUT)
     .map_err(|_| CaptureError::Exited("ScreenCaptureKit did not answer".into()))
@@ -204,7 +204,11 @@ fn writer(
       number(NSNumber::numberWithUnsignedInt(fps)),
     ],
   );
-  let codec = unsafe { AVVideoCodecTypeH264 }.ok_or_else(|| err("no H.264 codec"))?;
+  let codec = if crate::needs_hevc((w as u32, h as u32)) {
+    unsafe { AVVideoCodecTypeHEVC }.ok_or_else(|| err("no HEVC codec"))?
+  } else {
+    unsafe { AVVideoCodecTypeH264 }.ok_or_else(|| err("no H.264 codec"))?
+  };
   let settings = NSDictionary::<NSString, AnyObject>::from_retained_objects(
     &[
       key(unsafe { AVVideoCodecKey })?,

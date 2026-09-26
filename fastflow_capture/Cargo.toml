@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fibre.workspace = true
 fastflow_core.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]

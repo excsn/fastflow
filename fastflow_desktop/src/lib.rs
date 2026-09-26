@@ -3,8 +3,8 @@ pub mod permissions;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+use fibre::mpsc::UnboundedSyncSender as Sender;
 use std::fmt;
-use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use fastflow_core::geom::Point;

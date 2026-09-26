@@ -2,14 +2,13 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastflow_capture::{CaptureSession, CaptureSpec, ScreenCapture};
 use fastflow_core::camera::Geometry;
-use fastflow_core::config::{CameraConfig, Config};
+use fastflow_core::config::{CameraConfig, CaptureConfig, Config};
 use fastflow_core::geom::{Point, Rect};
 use fastflow_core::recording::{
   FORMAT_VERSION, InputEvent, InputKind, Meta, SegmentInfo, WindowInfo, WindowSample,
@@ -19,6 +18,7 @@ use fastflow_desktop::macos::display::{self, Display};
 use fastflow_desktop::macos::input::MacInputMonitor;
 use fastflow_desktop::macos::window::MacWindowSource;
 use fastflow_desktop::{InputMonitor, RawInput, WindowSource};
+use fibre::mpsc::{self, UnboundedSyncReceiver as Receiver, UnboundedSyncSender as Sender};
 use serde::Serialize;
 
 use crate::applog::log;
@@ -119,7 +119,7 @@ impl Recorder {
       .start(&CaptureSpec {
         display_index: display.index,
         display_id: display.id,
-        size_px: display.pixels,
+        size_px: cfg.capture.capture_size(display.pixels),
         fps: FPS,
         out: dir.join(&file),
       })
@@ -132,7 +132,7 @@ impl Recorder {
       backend: backend.name().into(),
       fps: FPS,
       first_frame: capture.confidence(),
-      segments: vec![segment(0, &display, file, 0)],
+      segments: vec![segment(0, &display, &cfg.capture, file, 0)],
       recovered: false,
       truncated_by: None,
       failed: None,
@@ -146,16 +146,16 @@ impl Recorder {
       },
     )?;
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::unbounded();
     let writer = {
       let dir = dir.clone();
       thread::spawn(move || write_sidecars(&dir, rx))
     };
 
-    let (input_tx, input_rx) = mpsc::channel::<RawInput>();
-    let forward = tx.clone();
+    let (input_tx, input_rx) = mpsc::unbounded::<RawInput>();
+    let mut forward = tx.clone();
     thread::spawn(move || {
-      for e in input_rx {
+      while let Ok(e) = input_rx.recv() {
         if forward.send(Record::Input(e)).is_err() {
           break;
         }
@@ -177,7 +177,7 @@ impl Recorder {
       let tx = tx.clone();
       let latest = Arc::clone(&latest);
       let target = Arc::clone(&target);
-      thread::spawn(move || sample_windows(&target, &sampling, &tx, &latest))
+      thread::spawn(move || sample_windows(&target, &sampling, tx, &latest))
     };
 
     Ok(Recorder {
@@ -227,7 +227,7 @@ impl Recorder {
     let spec = CaptureSpec {
       display_index: display.index,
       display_id: display.id,
-      size_px: display.pixels,
+      size_px: self.cfg.capture.capture_size(display.pixels),
       fps: FPS,
       out: self.dir.join(&file),
     };
@@ -282,10 +282,13 @@ impl Recorder {
       last.end_ms = Some(at);
     }
     let index = self.meta.segments.len() as u32;
-    self
-      .meta
-      .segments
-      .push(segment(index, &sw.display, sw.file.clone(), at));
+    self.meta.segments.push(segment(
+      index,
+      &sw.display,
+      &self.cfg.capture,
+      sw.file.clone(),
+      at,
+    ));
     *self.target.lock().unwrap() = Target {
       segment: index,
       surface: sw.display.bounds_pt,
@@ -372,7 +375,7 @@ impl Recorder {
   }
 
   /// Writes a marker into `input.jsonl` at the current moment.
-  pub fn mark(&self, kind: InputKind) {
+  pub fn mark(&mut self, kind: InputKind) {
     let _ = self.records.send(Record::Input(RawInput {
       at: Instant::now(),
       kind,
@@ -461,20 +464,30 @@ fn overlay_params(
   (backend.caps().can_exclude_windows && cfg.camera.enabled && cfg.camera.live_overlay).then(|| {
     OverlayParams {
       display_pt: display.bounds_pt,
-      geo: Geometry::new(&segment(0, display, file.to_owned(), 0), cfg.output.size),
+      geo: Geometry::new(
+        &segment(0, display, &cfg.capture, file.to_owned(), 0),
+        cfg.output.size,
+      ),
       camera: cfg.camera.clone(),
     }
   })
 }
 
-fn segment(index: u32, d: &Display, file: String, start_ms: i64) -> SegmentInfo {
+fn segment(
+  index: u32,
+  d: &Display,
+  capture: &CaptureConfig,
+  file: String,
+  start_ms: i64,
+) -> SegmentInfo {
+  let (w, h) = capture.capture_size(d.pixels);
   SegmentInfo {
     index,
     file,
     display_id: d.id,
-    surface_px: [d.pixels.0, d.pixels.1],
+    surface_px: [w, h],
     surface_pt: [d.bounds_pt.w, d.bounds_pt.h],
-    scale: d.scale,
+    scale: w as f64 / d.bounds_pt.w,
     start_ms,
     end_ms: None,
   }
@@ -504,7 +517,7 @@ fn ms_since(anchor: Instant, at: Instant) -> i64 {
 fn sample_windows(
   target: &Mutex<Target>,
   running: &AtomicBool,
-  tx: &Sender<Record>,
+  mut tx: Sender<Record>,
   latest: &Mutex<Option<WindowSample>>,
 ) {
   let started = Instant::now();
@@ -575,7 +588,7 @@ fn write_sidecars(dir: &Path, rx: Receiver<Record>) {
     }
   };
 
-  for r in rx {
+  while let Ok(r) = rx.recv() {
     let result = match (anchor, r) {
       (None, Record::Anchor(at)) => {
         anchor = Some(at);

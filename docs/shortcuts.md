@@ -22,6 +22,7 @@ Markers are stored in the recording's `input.jsonl`, so they apply again on ever
 | Rendering… / Last render | the current render's progress. When idle, the last result |
 | Show Last Render | reveals `render.mp4` in Finder |
 | Make GIF… | opens the GIF and WebP exporter |
+| Settings… | edits the defaults for new recordings. Apply to Last Recording also re-renders the newest one |
 | Screen Recording / Input Monitoring | shown while a grant is missing, opens the setup window |
 | Quit | stops any recording cleanly first |
 

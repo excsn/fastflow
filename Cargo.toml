@@ -31,6 +31,7 @@ objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 png = "0.18"
 dispatch2 = "0.3"
+fibre = { version = "0.6", default-features = false }
 block2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 proptest = "1"

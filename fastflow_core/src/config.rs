@@ -18,6 +18,21 @@ pub struct Config {
 pub struct CaptureConfig {
   /// "auto", "ffmpeg" or "sck".
   pub backend: String,
+  /// Widest capture in pixels. A wider display is scaled down while it is captured. 0 captures
+  /// every display at its native size.
+  pub max_width: u32,
+}
+
+impl CaptureConfig {
+  /// The size a display of `native` pixels is captured at. Both sides stay even for the encoder.
+  pub fn capture_size(&self, native: (u32, u32)) -> (u32, u32) {
+    if self.max_width == 0 || native.0 <= self.max_width {
+      return native;
+    }
+    let even = |v: f64| ((v / 2.0).round() as u32 * 2).max(2);
+    let w = even(self.max_width as f64);
+    (w, even(native.1 as f64 * w as f64 / native.0 as f64))
+  }
 }
 
 /// Durations in seconds.
@@ -85,6 +100,7 @@ impl Default for CaptureConfig {
   fn default() -> Self {
     CaptureConfig {
       backend: "auto".into(),
+      max_width: 4096,
     }
   }
 }
@@ -144,5 +160,40 @@ impl Default for OutputConfig {
       size: [1920, 1080],
       fps: 60,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn capture(max_width: u32) -> CaptureConfig {
+    CaptureConfig {
+      max_width,
+      ..CaptureConfig::default()
+    }
+  }
+
+  #[test]
+  fn narrow_displays_are_captured_native() {
+    assert_eq!(capture(4096).capture_size((3024, 1964)), (3024, 1964));
+    assert_eq!(capture(4096).capture_size((4096, 2304)), (4096, 2304));
+  }
+
+  #[test]
+  fn wide_displays_are_scaled_to_the_cap() {
+    assert_eq!(capture(4096).capture_size((6400, 3600)), (4096, 2304));
+    assert_eq!(capture(4096).capture_size((5120, 2160)), (4096, 1728));
+  }
+
+  #[test]
+  fn scaled_sides_stay_even() {
+    let (w, h) = capture(3001).capture_size((6400, 3600));
+    assert_eq!((w % 2, h % 2), (0, 0));
+  }
+
+  #[test]
+  fn zero_means_native() {
+    assert_eq!(capture(0).capture_size((6400, 3600)), (6400, 3600));
   }
 }

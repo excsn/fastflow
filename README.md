@@ -32,7 +32,8 @@ On first launch a setup window asks for Screen Recording and Input Monitoring. G
 | Get the finished video | nothing: stopping queues a render to `render.mp4`, with a notification when it is done |
 | Keep a slow stretch at full speed | ⌃⌥⌘K at its start and end while recording |
 | Skip quickly past a detour | ⌃⌥⌘X at its start and end while recording |
-| Change pacing, camera or blur | `config.toml` in the recording folder, then `fastflow render <id>` |
+| Change pacing, camera or blur | Settings… in the menu bar. Apply to Last Recording re-renders it |
+| Change one older recording | `config.toml` in its folder, then `fastflow render <id>` |
 | Try settings quickly | `fastflow preview <id>`, a half-size render from the proxy in seconds |
 | See why the output looks the way it does | `fastflow diagram <id>` |
 | Check what the camera saw | `fastflow render <dir> --boxes` |

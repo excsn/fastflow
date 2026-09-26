@@ -1,7 +1,7 @@
 //! One render at a time on a worker thread.
 
+use fibre::mpsc::{self, UnboundedSyncSender as Sender};
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -25,11 +25,11 @@ pub struct RenderQueue {
 
 impl RenderQueue {
   pub fn start(mut runner: Runner, on_done: OnDone) -> RenderQueue {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::unbounded::<String>();
     let status = Arc::new(Mutex::new(QueueStatus::default()));
     let shared = Arc::clone(&status);
     thread::spawn(move || {
-      for id in rx {
+      while let Ok(id) = rx.recv() {
         {
           let mut s = shared.lock().unwrap();
           s.queued.retain(|q| q != &id);
@@ -57,7 +57,7 @@ impl RenderQueue {
   }
 
   /// A recording already waiting is not queued twice.
-  pub fn push(&self, id: &str) {
+  pub fn push(&mut self, id: &str) {
     let mut s = self.status.lock().unwrap();
     if s.queued.iter().any(|q| q == id) {
       return;
@@ -75,13 +75,13 @@ impl RenderQueue {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::mpsc;
+  use fibre::mpsc;
   use std::time::Duration;
 
   #[test]
   fn renders_in_order_and_reports_each() {
-    let (done_tx, done_rx) = mpsc::channel();
-    let q = RenderQueue::start(
+    let (done_tx, done_rx) = mpsc::bounded(2);
+    let mut q = RenderQueue::start(
       Box::new(|id, progress| {
         progress(0.5);
         if id == "bad" {

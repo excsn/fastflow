@@ -5,10 +5,11 @@ mod notify;
 mod overlay;
 mod recorder;
 mod recovery;
+mod settings;
+mod settings_window;
 mod setup;
 
 use std::process::Command;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,7 @@ use fastflow_daemon::retention;
 use fastflow_daemon::server::{self, Handler};
 use fastflow_desktop::permissions::{self, Grant, Permission};
 use fastflow_render::job::{self, RenderJob};
+use fibre::mpsc;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use objc2::MainThreadMarker;
@@ -45,7 +47,7 @@ const DISK_CHECK_EVERY: Duration = Duration::from_secs(5);
 
 enum UserEvent {
   Menu(MenuEvent),
-  Request(Request, Sender<Response>),
+  Request(Request, mpsc::BoundedSyncSender<Response>),
   RenderDone(Finished),
   Hotkey(u32),
 }
@@ -100,7 +102,7 @@ struct SocketHandler {
 
 impl Handler for SocketHandler {
   fn handle(&self, request: Request) -> Response {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::bounded(1);
     let sent = self
       .proxy
       .lock()
@@ -126,6 +128,7 @@ struct Tray {
   render_state: MenuItem,
   reveal: MenuItem,
   make_gif: MenuItem,
+  settings: MenuItem,
   rows: Vec<PermissionRow>,
   quit: MenuItem,
 }
@@ -141,6 +144,7 @@ struct App {
   hotkeys: Option<Hotkeys>,
   overlay: Option<overlay::Overlay>,
   gif: Option<gif_window::GifWindow>,
+  settings: Option<settings_window::SettingsWindow>,
 }
 
 impl App {
@@ -159,6 +163,7 @@ impl App {
     let render_state = MenuItem::new("No renders yet", false, None);
     let reveal = MenuItem::new("Show Last Render", false, None);
     let make_gif = MenuItem::new("Make GIF…", true, None);
+    let settings = MenuItem::new("Settings…", true, None);
     let quit = MenuItem::new("Quit", true, None);
 
     menu.append(&title).unwrap();
@@ -167,6 +172,7 @@ impl App {
     menu.append(&render_state).unwrap();
     menu.append(&reveal).unwrap();
     menu.append(&make_gif).unwrap();
+    menu.append(&settings).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     for row in &rows {
       menu.append(&row.item).unwrap();
@@ -188,6 +194,7 @@ impl App {
       render_state,
       reveal,
       make_gif,
+      settings,
       rows,
       quit,
     });
@@ -372,7 +379,7 @@ impl App {
     let result = r.stop();
     self.show_recording_state();
     let id = result?;
-    if let Some(q) = &self.queue {
+    if let Some(q) = &mut self.queue {
       q.push(&id);
     }
     self.show_render_state();
@@ -415,7 +422,7 @@ impl App {
         } else if self.recorder.as_ref().is_some_and(|r| r.id() == id) {
           Err(format!("{id} is still recording"))
         } else {
-          if let Some(q) = &self.queue {
+          if let Some(q) = &mut self.queue {
             q.push(&id);
           }
           self.show_render_state();
@@ -442,7 +449,7 @@ impl App {
       .map(|(_, a)| *a);
     match action {
       Some(Action::ToggleRecording) => self.toggle_recording(),
-      Some(Action::Mark(kind)) => match &self.recorder {
+      Some(Action::Mark(kind)) => match &mut self.recorder {
         Some(r) => r.mark(kind),
         None => log(format!("marker {kind:?} ignored: not recording")),
       },
@@ -588,6 +595,14 @@ impl App {
         .show(mtm);
       return;
     }
+    if event.id == *tray.settings.id() {
+      let mtm = MainThreadMarker::new().expect("main thread");
+      self
+        .settings
+        .get_or_insert_with(|| settings_window::SettingsWindow::new(mtm))
+        .show(mtm);
+      return;
+    }
     if tray.rows.iter().any(|r| event.id == *r.item.id()) {
       self.show_setup(false);
     }
@@ -606,6 +621,9 @@ impl ApplicationHandler<UserEvent> for App {
           let mtm = MainThreadMarker::new().expect("main thread");
           g.tick(mtm);
         }
+        if let Some(id) = self.settings.as_mut().and_then(|s| s.tick()) {
+          let _ = self.handle_request(Request::Render { id });
+        }
         if self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
           self.sweep();
         }
@@ -620,7 +638,8 @@ impl ApplicationHandler<UserEvent> for App {
       .queue
       .as_ref()
       .is_some_and(|q| q.status().rendering.is_some());
-    let gif_open = self.gif.as_ref().is_some_and(|g| g.is_visible());
+    let gif_open = self.gif.as_ref().is_some_and(|g| g.is_visible())
+      || self.settings.as_ref().is_some_and(|s| s.is_visible());
     let period = if self.overlay.is_some() {
       OVERLAY_TICK
     } else if gif_open {
@@ -690,6 +709,7 @@ fn main() {
     hotkeys: None,
     overlay: None,
     gif: None,
+    settings: None,
   };
   event_loop.run_app(&mut app).expect("event loop");
 }

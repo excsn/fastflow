@@ -1,7 +1,7 @@
-use std::cell::Cell;
+use fibre::mpsc::UnboundedSyncSender as Sender;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
 use core_foundation::runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes};
@@ -59,6 +59,7 @@ pub struct MacInputMonitor {
 impl InputMonitor for MacInputMonitor {
   fn start(&mut self, sink: Sender<RawInput>) -> Result<()> {
     let disabled = Arc::clone(&self.disabled);
+    let sink = RefCell::new(sink);
     let last_motion: Cell<Option<(InputKind, Instant)>> = Cell::new(None);
     let tap = CGEventTap::new(
       CGEventTapLocation::Session,
@@ -74,11 +75,11 @@ impl InputMonitor for MacInputMonitor {
               .is_some_and(|(prev, t)| prev == k && at.duration_since(t) < MOTION_INTERVAL);
             if !recent {
               last_motion.set(Some((k, at)));
-              let _ = sink.send(RawInput { at, kind: k });
+              let _ = sink.borrow_mut().send(RawInput { at, kind: k });
             }
           }
           Some(k) => {
-            let _ = sink.send(RawInput { at, kind: k });
+            let _ = sink.borrow_mut().send(RawInput { at, kind: k });
           }
           None => disabled.store(true, Ordering::Relaxed),
         }

@@ -92,6 +92,14 @@ pub fn detect(backend: &str) -> Result<Box<dyn ScreenCapture>> {
   }
 }
 
+/// Longest side, in pixels, the VideoToolbox H.264 encoder accepts.
+pub const H264_MAX_SIDE: u32 = 4096;
+
+/// Whether a capture of `size` pixels has to be encoded as HEVC.
+pub fn needs_hevc(size: (u32, u32)) -> bool {
+  size.0 > H264_MAX_SIDE || size.1 > H264_MAX_SIDE
+}
+
 /// The file name a backend writes a segment to.
 pub fn segment_file(backend: &str, index: u32) -> String {
   match backend {

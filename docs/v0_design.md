@@ -25,12 +25,13 @@ fastflow films what actually happened on the real screen. It is not a scripted t
 
 ## Capture
 
-The whole display is captured once at native resolution. Nothing is cropped or sped up at capture time. Two sidecars are recorded alongside it. One holds the time and kind of every keyboard and mouse event. The other holds every on-screen window's rect plus the cursor, 10 times a second.
+The whole display is captured once at native resolution, up to 4096 pixels wide. Nothing is cropped or sped up at capture time. Two sidecars are recorded alongside it. One holds the time and kind of every keyboard and mouse event. The other holds every on-screen window's rect plus the cursor, 10 times a second.
 
 - **ScreenCaptureKit** is the default backend. Frames go from `SCStream` straight into a hardware H.264 `AVAssetWriter` as fragmented QuickTime, with fastflow's own windows excluded. Frame timestamps are on the host clock, so the anchor is exact to within a frame. Only frames where the screen changed are delivered.
 - **ffmpeg** with `avfoundation` is the fallback, selected with `capture.backend = "ffmpeg"`. It writes fragmented mp4, cannot exclude windows or follow displays and anchors about 180ms late.
 - **Input** is recorded as kind and time only. The file never holds which key was pressed. Mouse moves and drags are recorded at most every 50ms.
 - **Resolution.** A 1600x1000pt window on a 2x display is 3200x2000 pixels, which leaves room to crop tightly and still fill a 1080p output.
+- **Wide displays.** A display wider than `capture.max_width`, 4096 by default, is scaled down to it while it is captured. At the 2x zoom limit a crop of a 4096-wide capture still covers a 1080p output. Native 6400x3600 capture dropped 19% of its frames and rendered at about a quarter of real time. H.264 encodes at most 4096 pixels a side, so setting `max_width` above 4096 or to 0 for native size records wider displays as HEVC.
 
 ## Pacing
 
@@ -107,9 +108,12 @@ Make GIF… turns a stretch of the rendered, raw or preview video into an animat
 
 Each recording has a `config.toml`, copied at record time from `~/Library/Application Support/com.excsn.mac.fastflow/config.toml` when that exists. Every field has a default, so a file only needs what it changes.
 
+Settings… in the menu bar edits that file in five tabs: Capture, Pacing, Camera, Focus and Output. It writes only the settings that differ from the defaults, so a later change to a default still reaches everything left alone. Apply to Last Recording also writes them into the newest recording and re-renders it.
+
 ```toml
 [capture]
-backend = "auto"             # "auto", "sck" or "ffmpeg"
+backend   = "auto"           # "auto", "sck" or "ffmpeg"
+max_width = 4096             # pixels; wider displays are scaled down, 0 captures native
 
 [pacing]
 pad_before  = 0.3            # seconds of source before each input kept at full speed

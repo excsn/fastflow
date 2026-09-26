@@ -9,6 +9,7 @@ name = "fastflow-app"
 path = "src/main.rs"
 
 [dependencies]
+fibre.workspace = true
 chrono.workspace = true
 fastflow_capture.workspace = true
 fastflow_core.workspace = true

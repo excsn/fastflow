@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +17,7 @@ use block2::RcBlock;
 use fastflow_core::recording::Meta;
 use fastflow_daemon::paths;
 use fastflow_render::export::{self, ExportSpec, Format};
+use fibre::oneshot;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
@@ -301,8 +301,8 @@ pub struct GifWindow {
   settings: Option<Settings>,
   changed_at: Instant,
   estimated: Option<Settings>,
-  estimate: Option<(Settings, Receiver<Result<u64, String>>)>,
-  export: Option<(Arc<Mutex<f64>>, Receiver<ExportResult>)>,
+  estimate: Option<(Settings, oneshot::Receiver<Result<u64, String>>)>,
+  export: Option<(Arc<Mutex<f64>>, oneshot::Receiver<ExportResult>)>,
   last_grab: Grab,
   scrub: Rc<RefCell<Scrub>>,
   duration: Rc<Cell<f64>>,
@@ -1016,7 +1016,7 @@ impl GifWindow {
       && self.estimated.as_ref() != Some(settings)
       && self.range.ivars().grabbed.get() == Grab::None
     {
-      let (tx, rx) = mpsc::channel();
+      let (tx, rx) = oneshot::oneshot();
       let spec = settings.spec(PathBuf::new());
       let scratch = l.dir.join(".gif-estimate");
       thread::spawn(move || {
@@ -1092,7 +1092,7 @@ impl GifWindow {
     let out = unused_output(&l.dir, settings.format);
     let spec = settings.spec(out.clone());
     let progress = Arc::new(Mutex::new(0.0));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = oneshot::oneshot();
     let shared = Arc::clone(&progress);
     thread::spawn(move || {
       let r = export::export(&spec, &mut |p| *shared.lock().unwrap() = p)
