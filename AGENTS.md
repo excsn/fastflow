@@ -17,6 +17,9 @@ cargo build --release -p fastflow_cli
 
 FASTFLOW_SIGN_IDENTITY="<identity>" fastflow_ui_macos/bundle/bundle.sh --install
 open /Applications/fastflow.app
+
+scripts/icons.sh                                                 # regenerate the icons from assets/
+FASTFLOW_RELEASE_IDENTITY="Developer ID Application: <name>" scripts/release.sh   # notarized dmg and cask in dist/
 ```
 
 ## Before calling a change done

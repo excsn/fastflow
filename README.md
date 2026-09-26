@@ -12,17 +12,30 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how it fits together, [docs/v0_design
 
 ## Install
 
-fastflow is built from source on the Mac that runs it. It needs macOS 12.3 or later, Rust with edition 2024 and ffmpeg for rendering.
+fastflow needs an Apple Silicon Mac with macOS 12.3 or later. Homebrew installs the app, the `fastflow` command and ffmpeg:
 
 ```sh
-brew install ffmpeg
-git clone <repo> fastflow && cd fastflow
+brew install --cask excsn/tap/fastflow
+open /Applications/fastflow.app
+```
+
+On first launch a setup window asks for Screen Recording and Input Monitoring. Grant both and click **Restart fastflow**.
+
+`brew uninstall --cask fastflow` removes the app and the command. Adding `--zap` also removes settings and logs. Recordings in `~/Movies/fastflow` are kept.
+
+### From source
+
+Building needs Rust with edition 2024 and ffmpeg.
+
+```sh
+brew install ffmpeg webp
+git clone https://github.com/excsn/fastflow.git && cd fastflow
 fastflow_ui_macos/bundle/bundle.sh --install      # builds, signs ad-hoc, installs /Applications/fastflow.app
 cargo install --path fastflow_cli                 # the fastflow command
 open /Applications/fastflow.app
 ```
 
-On first launch a setup window asks for Screen Recording and Input Monitoring. Grant both and click **Restart fastflow**. An ad-hoc build needs the grants again after every rebuild; set `FASTFLOW_SIGN_IDENTITY` to a code-signing identity to keep them.
+An ad-hoc build needs the grants again after every rebuild; set `FASTFLOW_SIGN_IDENTITY` to a code-signing identity to keep them.
 
 ## What to reach for
 
