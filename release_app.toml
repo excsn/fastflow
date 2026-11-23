@@ -1,0 +1,20 @@
+name = "fastflow"
+version_package = "fastflow_ui_macos"
+repo = "excsn/fastflow"
+tap = "excsn/homebrew-tap"
+cask = "packaging/fastflow.rb"
+
+[bundle]
+name = "fastflow.app"
+identifier = "com.excsn.mac.fastflow"
+info_plist = "fastflow_ui_macos/bundle/Info.plist"
+resources = ["fastflow_ui_macos/bundle/fastflow.icns"]
+
+[[bundle.binary]]
+package = "fastflow_ui_macos"
+name = "fastflow-app"
+
+[[bundle.binary]]
+package = "fastflow_cli"
+name = "fastflow"
+identifier = "com.excsn.mac.fastflow.cli"
