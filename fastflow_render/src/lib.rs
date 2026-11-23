@@ -68,7 +68,7 @@ pub trait FrameSource {
   fn fps(&self) -> f64;
   /// The latest frame at or before `src_t`. Decodes forward only; `src_t` must not decrease.
   fn advance_to(&mut self, src_t: f64) -> Result<&Frame>;
-  /// Preview loops only. See docs/07-render.md.
+  /// Restarts decoding at `src_t`. Called at most once per slice, never per frame.
   fn seek(&mut self, src_t: f64) -> Result<()>;
 }
 

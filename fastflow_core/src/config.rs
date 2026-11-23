@@ -86,6 +86,18 @@ pub struct FocusConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RenderConfig {
   pub switch_ms: u32,
+  pub on_stop: OnStop,
+}
+
+/// What runs when a recording stops. Nothing is rendered until it is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnStop {
+  /// Build the proxy and the scrub file, then open the composition window.
+  Editor,
+  /// Build the proxy and the scrub file, then post a notification.
+  Scrub,
+  None,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,7 +162,10 @@ impl Default for FocusConfig {
 
 impl Default for RenderConfig {
   fn default() -> Self {
-    RenderConfig { switch_ms: 400 }
+    RenderConfig {
+      switch_ms: 400,
+      on_stop: OnStop::Editor,
+    }
   }
 }
 

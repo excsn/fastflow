@@ -2,25 +2,38 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use fastflow_core::slices::Format;
 use fastflow_daemon::paths;
 use fastflow_daemon::protocol::{Finished, Request, Response};
 use fastflow_daemon::server;
-use fastflow_render::job::{self, RenderJob};
+use fastflow_render::job::{self, RenderJob, Target};
 
 const USAGE: &str = "usage:
   fastflow start                   start recording
-  fastflow stop                    stop recording and queue its render
+  fastflow stop                    stop recording and prepare its scrub preview
   fastflow status                  what is recording and rendering
   fastflow list [n]                the newest n recordings, default 5
-  fastflow render <id>             queue a re-render in the app
+  fastflow render <id> [--output <name>]
+                                   queue a render in the app, every output or one
   fastflow pin <id>                keep its raw footage past the 7-day sweep
   fastflow unpin <id>
-  fastflow render <dir> [-o <out.mp4>] [--boxes]
-                                   render a recording directory here, without the app
+  fastflow render <dir> [options]  render here, without the app. Every output of
+                                   slices.toml. Without one it writes render.mp4
+      --output <name>              only this output
+      --slice <from>-<to>          a one-off output of these source seconds, repeatable,
+                                   played in the order given
+      --format mp4|gif|webp        for --slice, default mp4
+      --width <px> --fps <n>       for --slice, default the config's or 800 and 15
+      --dissolve <ms>              for --slice, cross-dissolve at each join, default 0
+      -o <file>                    where to write a single output
+      --boxes                      draw the camera's inputs over the whole frame
   fastflow diagram <id|dir> [cols] print what pacing and the camera decided
   fastflow proxy <id|dir>          make the small proxy.mp4 that previews read
-  fastflow preview <id|dir>        render preview.mp4 from the proxy, for tuning config.toml
-  fastflow gif <id|dir> [options]  make an animated GIF or WebP from a recording
+  fastflow scrub <id|dir>          make scrub.mp4, the paced and framed preview the
+                                   composition window plays
+  fastflow preview <id|dir> [--output <name>]
+                                   render preview.mp4 from the proxy, for tuning config.toml
+  fastflow gif <id|dir> [options]  make an animated GIF or WebP from a rendered video
       --source render|raw|preview  which video to cut from, default render
       --from <s> --to <s>          the range in seconds, default the whole video
       --speed <x>                  extra playback speed, default 1
@@ -29,14 +42,13 @@ const USAGE: &str = "usage:
       --webp [--quality <n>]       WebP instead of GIF, lossy quality default 70
       -o <file>                    default clip.gif or clip.webp in the recording
 
-  --boxes   render the whole frame with the sampled windows, cursor, chosen subject
-            and camera rect drawn on it, to check the camera's inputs";
+  Slice times are source seconds, the axis fastflow diagram prints.";
 
 fn main() -> ExitCode {
   let args: Vec<String> = std::env::args().skip(1).collect();
   let result = match (args.first().map(String::as_str), &args[1.min(args.len())..]) {
     (Some("start"), []) => ask(Request::Start).map(|r| println!("recording {}", id(&r))),
-    (Some("stop"), []) => ask(Request::Stop).map(|r| println!("stopped {}, rendering", id(&r))),
+    (Some("stop"), []) => ask(Request::Stop).map(|r| println!("stopped {}", id(&r))),
     (Some("status"), []) => ask(Request::Status).map(print_status),
     (Some("list"), rest) => parse_limit(rest)
       .and_then(|limit| ask(Request::List { limit }))
@@ -53,20 +65,16 @@ fn main() -> ExitCode {
     (Some("proxy"), [target]) => resolve(target)
       .and_then(|dir| job::make_proxy(&dir))
       .map(|p| println!("wrote {}", p.display())),
-    (Some("preview"), [target]) => resolve(target).and_then(|dir| {
-      render(&RenderJob {
-        out: dir.join("preview.mp4"),
-        dir,
-        boxes: false,
-        preview: true,
-      })
-    }),
+    (Some("scrub"), [target]) => resolve(target).and_then(|dir| scrub(&dir)),
+    (Some("preview"), [target, rest @ ..]) => resolve(target).and_then(|dir| preview(dir, rest)),
     (Some("pin"), [id]) => set_pinned(id, true),
     (Some("unpin"), [id]) => set_pinned(id, false),
-    (Some("render"), [target]) if !std::path::Path::new(target).is_dir() => {
-      ask(Request::Render { id: target.clone() }).map(|r| println!("queued {}", id(&r)))
-    }
-    (Some("render"), rest) => parse_render(rest).and_then(|j| render(&j)),
+    (Some("render"), rest) => parse_render(rest).and_then(|cmd| match cmd {
+      RenderCmd::Queue { id, output } => {
+        ask(Request::Render { id, output }).map(|r| println!("queued {}", self::id(&r)))
+      }
+      RenderCmd::Local(jobs) => jobs.iter().try_for_each(render),
+    }),
     _ => Err(USAGE.into()),
   };
   match result {
@@ -240,7 +248,7 @@ fn print_status(r: Response) {
     None => println!("recording  -"),
   }
   match &s.rendering {
-    Some(r) => println!("rendering  {} {:.0}%", r.id, r.progress * 100.0),
+    Some(r) => println!("rendering  {} {:.0}%", r.job.label(), r.progress * 100.0),
     None => println!("rendering  -"),
   }
   if !s.queued.is_empty() {
@@ -248,10 +256,13 @@ fn print_status(r: Response) {
   }
   match &s.last {
     Some(Finished {
-      id,
+      job,
       result: Ok(path),
-    }) => println!("last       {id} -> {path}"),
-    Some(Finished { id, result: Err(e) }) => println!("last       {id} failed: {e}"),
+    }) => println!("last       {} -> {path}", job.label()),
+    Some(Finished {
+      job,
+      result: Err(e),
+    }) => println!("last       {} failed: {e}", job.label()),
     None => {}
   }
 }
@@ -269,37 +280,170 @@ fn print_list(r: Response) {
   }
 }
 
-fn parse_render(args: &[String]) -> Result<RenderJob, String> {
-  let (mut dir, mut out, mut boxes) = (None, None, false);
+enum RenderCmd {
+  Queue { id: String, output: Option<String> },
+  Local(Vec<RenderJob>),
+}
+
+fn parse_render(args: &[String]) -> Result<RenderCmd, String> {
+  let (mut target, mut out, mut boxes, mut output) = (None::<String>, None, false, None);
+  let mut ranges = Vec::new();
+  let mut one_off = Target::whole();
+  let mut one_off_flag = false;
   let mut it = args.iter();
   while let Some(a) = it.next() {
+    let mut value = || it.next().ok_or_else(|| USAGE.to_string());
+    let num = |v: &String| {
+      v.parse::<u32>()
+        .map_err(|_| format!("not a whole number: {v}"))
+    };
     match a.as_str() {
-      "-o" => out = Some(PathBuf::from(it.next().ok_or(USAGE)?)),
+      "-o" => out = Some(PathBuf::from(value()?)),
       "--boxes" => boxes = true,
-      _ if dir.is_none() && !a.starts_with('-') => dir = Some(PathBuf::from(a)),
+      "--output" => output = Some(value()?.clone()),
+      "--slice" => ranges.push(parse_range(value()?)?),
+      "--format" => {
+        one_off_flag = true;
+        one_off.format = match value()?.as_str() {
+          "mp4" => Format::Mp4,
+          "gif" => Format::Gif,
+          "webp" => Format::Webp,
+          other => return Err(format!("unknown format {other}")),
+        }
+      }
+      "--width" => {
+        one_off_flag = true;
+        one_off.width = Some(num(value()?)?);
+      }
+      "--fps" => {
+        one_off_flag = true;
+        one_off.fps = Some(num(value()?)?);
+      }
+      "--dissolve" => {
+        one_off_flag = true;
+        one_off.dissolve_ms = num(value()?)?;
+      }
+      _ if target.is_none() && !a.starts_with('-') => target = Some(a.clone()),
       _ => return Err(USAGE.into()),
     }
   }
-  let dir: PathBuf = dir.ok_or(USAGE)?;
-  let out = out.unwrap_or_else(|| dir.join(if boxes { "boxes.mp4" } else { "render.mp4" }));
-  Ok(RenderJob {
+  let target = target.ok_or(USAGE)?;
+  if one_off_flag && ranges.is_empty() {
+    return Err("--format, --width, --fps and --dissolve go with --slice".into());
+  }
+  if output.is_some() && !ranges.is_empty() {
+    return Err("--output and --slice cannot be combined".into());
+  }
+  let local =
+    std::path::Path::new(&target).is_dir() || out.is_some() || boxes || !ranges.is_empty();
+  if !local {
+    return Ok(RenderCmd::Queue { id: target, output });
+  }
+  let dir = resolve(&target)?;
+  let jobs = if boxes {
+    vec![RenderJob {
+      out: out.unwrap_or_else(|| dir.join("boxes.mp4")),
+      dir,
+      boxes: true,
+      preview: false,
+      target: Target {
+        ranges: (!ranges.is_empty()).then_some(ranges),
+        ..one_off
+      },
+    }]
+  } else if !ranges.is_empty() {
+    one_off.ranges = Some(ranges);
+    vec![RenderJob {
+      out: out.unwrap_or_else(|| dir.join(format!("clip.{}", one_off.format.extension()))),
+      dir,
+      boxes: false,
+      preview: false,
+      target: one_off,
+    }]
+  } else if let Some(name) = output {
+    let mut job = job::output_job(&dir, &name)?;
+    if let Some(o) = out {
+      job.out = o;
+    }
+    vec![job]
+  } else {
+    let slices = job::load_slices(&dir)?;
+    if out.is_some() && slices.outputs.len() != 1 {
+      return Err("-o needs a single output; pick one with --output".into());
+    }
+    slices
+      .outputs
+      .iter()
+      .map(|o| RenderJob {
+        out: out.clone().unwrap_or_else(|| job::output_path(&dir, o)),
+        dir: dir.clone(),
+        boxes: false,
+        preview: false,
+        target: Target::of(&slices, o),
+      })
+      .collect()
+  };
+  Ok(RenderCmd::Local(jobs))
+}
+
+fn parse_range(v: &str) -> Result<std::ops::Range<f64>, String> {
+  let bad = || format!("a slice is <from>-<to> in seconds, not {v}");
+  let (a, b) = v.split_once('-').ok_or_else(bad)?;
+  let (a, b): (f64, f64) = (a.parse().map_err(|_| bad())?, b.parse().map_err(|_| bad())?);
+  if a < b { Ok(a..b) } else { Err(bad()) }
+}
+
+fn preview(dir: PathBuf, args: &[String]) -> Result<(), String> {
+  let target = match args {
+    [] => Target::whole(),
+    [flag, name] if flag == "--output" => job::output_job(&dir, name)?.target,
+    _ => return Err(USAGE.into()),
+  };
+  render(&RenderJob {
+    out: dir.join("preview.mp4"),
     dir,
-    out,
-    boxes,
-    preview: false,
+    boxes: false,
+    preview: true,
+    target: Target {
+      format: Format::Mp4,
+      ..target
+    },
   })
 }
 
-fn render(job: &RenderJob) -> Result<(), String> {
+fn scrub(dir: &std::path::Path) -> Result<(), String> {
+  if !dir.join(job::PROXY_FILE).is_file() {
+    let p = job::make_proxy(dir)?;
+    eprintln!("wrote {}", p.display());
+  }
+  let started = std::time::Instant::now();
+  let out = job::make_scrub(dir, &mut |_| {}, &mut progress_line("scrubbing"))?;
+  eprintln!(
+    "\nwrote {} in {:.1}s",
+    out.display(),
+    started.elapsed().as_secs_f64()
+  );
+  Ok(())
+}
+
+fn progress_line(verb: &'static str) -> impl FnMut(u64, u64) {
   let mut last_shown = u64::MAX;
-  let report = job::run(job, &mut |line| eprintln!("{line}"), &mut |done, total| {
+  move |done, total| {
     let pct = done * 100 / total.max(1);
     if pct != last_shown {
       last_shown = pct;
-      eprint!("\rrendering {pct:3}% ({done}/{total} frames)");
+      eprint!("\r{verb} {pct:3}% ({done}/{total} frames)");
       let _ = std::io::stderr().flush();
     }
-  })?;
+  }
+}
+
+fn render(job: &RenderJob) -> Result<(), String> {
+  let report = job::run(
+    job,
+    &mut |line| eprintln!("{line}"),
+    &mut progress_line("rendering"),
+  )?;
   eprintln!(
     "\nwrote {} ({} frames) in {:.1}s",
     report.out.display(),

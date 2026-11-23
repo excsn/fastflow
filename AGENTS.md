@@ -14,6 +14,7 @@ cargo build --release -p fastflow_cli
 ./target/release/fastflow render ~/Movies/fastflow/<id>          # render a recording locally
 ./target/release/fastflow diagram <id>                           # what pacing and the camera decided
 ./target/release/fastflow preview <id>                           # half-size render from the proxy
+./target/release/fastflow scrub <id>                             # the scrub file Compose… plays
 
 FASTFLOW_SIGN_IDENTITY="<identity>" fastflow_ui_macos/bundle/bundle.sh --install
 open /Applications/fastflow.app
@@ -37,7 +38,9 @@ FASTFLOW_RELEASE_IDENTITY="Developer ID Application: <name>" scripts/release.sh 
 - **Tracks are pure.** `fastflow_core` does no I/O and calls no platform API. The timeline and camera track are functions of the sidecars and the config.
 - **The camera works in output time.** Moves are placed with `Timeline::out_time_at`. Building them in source time makes a sped-up span whip the camera around.
 - **One director.** The offline track and the live overlay both use `Director` and `plan_move`. Change them there, never in one caller.
-- **Forward decoding only.** `FrameSource::advance_to` must never be asked to go back. Seeking per frame turns a linear render quadratic.
+- **Forward decoding only.** `FrameSource::advance_to` must never be asked to go back. Seeking per frame turns a linear render quadratic. A slice join is the one place a decoder restarts, through `seek`.
+- **Slices are windows of the full timeline.** Never pace or build a camera track per slice. A slice must show exactly what the scrub file shows at that moment.
+- **Nothing renders by itself.** Stopping a recording prepares the proxy and the scrub file. A render starts only from Compose…, the CLI or the socket.
 - **Crash safety.** Capture writes fragmented files and `meta.json` is rewritten at every segment switch. A killed recording must still render.
 - **Main thread.** The event tap and the recorder live on the main run loop. Socket requests reach them through the winit event loop.
 - **Permissions.** Grants are tied to the code signature. An ad-hoc build loses them on every rebuild; sign with a real identity while developing.

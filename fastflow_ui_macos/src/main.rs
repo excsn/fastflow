@@ -1,6 +1,7 @@
 mod applog;
 mod build_id;
-mod gif_window;
+mod compose_window;
+mod list_table;
 mod notify;
 mod overlay;
 mod recorder;
@@ -9,6 +10,7 @@ mod render_panel;
 mod settings;
 mod settings_window;
 mod setup;
+mod track;
 mod tray_art;
 
 use std::process::Command;
@@ -16,14 +18,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use applog::log;
+use fastflow_core::config::OnStop;
 use fastflow_core::recording::InputKind;
 use fastflow_daemon::paths;
-use fastflow_daemon::protocol::{Finished, Request, Response, Status};
+use fastflow_daemon::protocol::{Finished, Job, Request, Response, Status, Task};
 use fastflow_daemon::queue::RenderQueue;
 use fastflow_daemon::retention;
 use fastflow_daemon::server::{self, Handler};
 use fastflow_desktop::permissions::{self, Grant, Permission};
-use fastflow_render::job::{self, RenderJob};
+use fastflow_render::job::{self, RenderJob, Target};
 use fibre::mpsc;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -41,7 +44,7 @@ use winit::window::WindowId;
 const PERMISSION_POLL: Duration = Duration::from_secs(2);
 const RECORDING_TICK: Duration = Duration::from_millis(100);
 const OVERLAY_TICK: Duration = Duration::from_millis(16);
-const GIF_WINDOW_TICK: Duration = Duration::from_millis(50);
+const COMPOSE_WINDOW_TICK: Duration = Duration::from_millis(50);
 const RENDERING_TICK: Duration = Duration::from_millis(500);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SWEEP_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -134,8 +137,8 @@ struct Tray {
   last_folder: MenuItem,
   last_render: MenuItem,
   last_raw: MenuItem,
-  last_gif: MenuItem,
-  make_gif: MenuItem,
+  last_compose: MenuItem,
+  compose: MenuItem,
   settings: MenuItem,
   rows: Vec<PermissionRow>,
   quit: MenuItem,
@@ -151,7 +154,9 @@ struct App {
   last_disk_check: Option<Instant>,
   hotkeys: Option<Hotkeys>,
   overlay: Option<overlay::Overlay>,
-  gif: Option<gif_window::GifWindow>,
+  compose: Option<compose_window::ComposeWindow>,
+  /// A recording whose composition window opens once its preview is ready.
+  open_when_prepared: Option<(String, OnStop)>,
   settings: Option<settings_window::SettingsWindow>,
   panel: Option<render_panel::RenderPanel>,
   /// The newest recording that is not still recording.
@@ -176,11 +181,11 @@ impl App {
     let last_folder = MenuItem::new("Open Folder", true, None);
     let last_render = MenuItem::new("Play Render", false, None);
     let last_raw = MenuItem::new("Play Raw", true, None);
-    let last_gif = MenuItem::new("Make GIF…", true, None);
-    for item in [&last_folder, &last_render, &last_raw, &last_gif] {
+    let last_compose = MenuItem::new("Compose…", true, None);
+    for item in [&last_folder, &last_render, &last_raw, &last_compose] {
       last.append(item).unwrap();
     }
-    let make_gif = MenuItem::new("Make GIF…", true, None);
+    let compose = MenuItem::new("Compose…", true, None);
     let settings = MenuItem::new("Settings…", true, None);
     let quit = MenuItem::new("Quit", true, None);
 
@@ -189,7 +194,7 @@ impl App {
     menu.append(&record).unwrap();
     menu.append(&render_state).unwrap();
     menu.append(&last).unwrap();
-    menu.append(&make_gif).unwrap();
+    menu.append(&compose).unwrap();
     menu.append(&settings).unwrap();
     menu.append(&PredefinedMenuItem::separator()).unwrap();
     for row in &rows {
@@ -217,8 +222,8 @@ impl App {
       last_folder,
       last_render,
       last_raw,
-      last_gif,
-      make_gif,
+      last_compose,
+      compose,
       settings,
       rows,
       quit,
@@ -294,25 +299,49 @@ impl App {
   }
 
   fn start_daemon(&mut self) {
-    let runner = Box::new(|id: &str, progress: &mut dyn FnMut(f64)| {
+    let runner = Box::new(|work: &Job, progress: &mut dyn FnMut(f64)| {
+      let id = &work.id;
       let dir = paths::recordings().join(id);
-      let out = dir.join("render.mp4");
-      log(format!("render {id} started"));
-      let report = job::run(
-        &RenderJob {
-          dir: dir.clone(),
-          out,
-          boxes: false,
-          preview: false,
-        },
-        &mut |line| log(format!("render {id}: {line}")),
-        &mut |done, total| progress(done as f64 / total.max(1) as f64),
-      )?;
-      match job::make_proxy(&dir) {
-        Ok(p) => log(format!("proxy {id}: {}", p.display())),
-        Err(e) => log(format!("proxy {id}: {e}")),
+      let done = |d: u64, t: u64| d as f64 / t.max(1) as f64;
+      if work.task == Task::Prepare {
+        log(format!("prepare {id} started"));
+        let out = job::prepare(
+          &dir,
+          &mut |line| log(format!("prepare {id}: {line}")),
+          &mut |d, t| progress(done(d, t)),
+        )?;
+        return Ok(out.to_string_lossy().into_owned());
       }
-      Ok(report.out.to_string_lossy().into_owned())
+      let jobs: Vec<RenderJob> = match &work.output {
+        Some(name) => vec![job::output_job(&dir, name)?],
+        None => {
+          let slices = job::load_slices(&dir)?;
+          slices
+            .outputs
+            .iter()
+            .map(|o| RenderJob {
+              dir: dir.clone(),
+              out: job::output_path(&dir, o),
+              target: Target::of(&slices, o),
+              boxes: false,
+              preview: false,
+            })
+            .collect()
+        }
+      };
+      let mut written = Vec::new();
+      for (i, rj) in jobs.iter().enumerate() {
+        log(format!("render {id} started: {}", rj.out.display()));
+        let report = job::run(
+          rj,
+          &mut |line| log(format!("render {id}: {line}")),
+          &mut |d, t| progress((i as f64 + done(d, t)) / jobs.len() as f64),
+        )?;
+        written.push(report.out.to_string_lossy().into_owned());
+      }
+      written
+        .pop()
+        .ok_or_else(|| format!("{id} has no outputs to render"))
     });
     let proxy = self.proxy.clone();
     let on_done = Box::new(move |f: &Finished| {
@@ -395,7 +424,8 @@ impl App {
     Ok(id)
   }
 
-  /// A recording that stopped cleanly is queued for rendering straight away.
+  /// Nothing is rendered when a recording stops. `render.on_stop` decides whether its preview
+  /// is prepared and the composition window opened.
   fn stop_recording(&mut self) -> Result<String, String> {
     let r = self.recorder.take().ok_or("not recording")?;
     if let Some(o) = self.overlay.take() {
@@ -404,8 +434,13 @@ impl App {
     let result = r.stop();
     self.show_recording_state();
     let id = result?;
-    if let Some(q) = &mut self.queue {
-      q.push(&id);
+    let config = paths::recordings().join(&id).join("config.toml");
+    let on_stop = settings::load(&config).map_or(OnStop::Editor, |c| c.render.on_stop);
+    if on_stop != OnStop::None
+      && let Some(q) = &mut self.queue
+    {
+      q.push(Job::prepare(&id));
+      self.open_when_prepared = Some((id.clone(), on_stop));
     }
     self.show_render_state();
     Ok(id)
@@ -428,7 +463,7 @@ impl App {
     Status {
       recording: self.recorder.as_ref().map(|r| r.id()),
       rendering: q.rendering,
-      queued: q.queued.into_iter().collect(),
+      queued: q.queued.iter().map(Job::label).collect(),
       last: q.last,
     }
   }
@@ -441,19 +476,9 @@ impl App {
         status: Some(self.status()),
         ..Response::ok()
       }),
-      Request::Render { id } => {
-        if !paths::recordings().join(&id).join("meta.json").is_file() {
-          Err(format!("no recording {id}"))
-        } else if self.recorder.as_ref().is_some_and(|r| r.id() == id) {
-          Err(format!("{id} is still recording"))
-        } else {
-          if let Some(q) = &mut self.queue {
-            q.push(&id);
-          }
-          self.show_render_state();
-          Ok(Response::with_id(id))
-        }
-      }
+      Request::Render { id, output } => self
+        .queue_job(Job::render(&id, output.as_deref()))
+        .map(|()| Response::with_id(id)),
       Request::Resegment => match self.recorder.as_mut() {
         Some(r) => r.resegment().map(|()| Response::with_id(r.id())),
         None => Err("not recording".into()),
@@ -464,6 +489,21 @@ impl App {
       }),
     };
     result.unwrap_or_else(Response::error)
+  }
+
+  fn queue_job(&mut self, work: Job) -> Result<(), String> {
+    let id = &work.id;
+    if !paths::recordings().join(id).join("meta.json").is_file() {
+      return Err(format!("no recording {id}"));
+    }
+    if self.recorder.as_ref().is_some_and(|r| r.id() == *id) {
+      return Err(format!("{id} is still recording"));
+    }
+    if let Some(q) = &mut self.queue {
+      q.push(work);
+    }
+    self.show_render_state();
+    Ok(())
   }
 
   fn on_hotkey(&mut self, id: u32) {
@@ -483,17 +523,53 @@ impl App {
   }
 
   fn on_render_done(&mut self, f: Finished) {
-    match &f.result {
-      Ok(path) => {
-        log(format!("render {} done: {path}", f.id));
-        notify::post(&f.id, "Render finished", &f.id);
+    let label = f.job.label();
+    match (f.job.task, &f.result) {
+      (Task::Render, Ok(path)) => {
+        log(format!("render {label} done: {path}"));
+        notify::post(&f.job.id, "Render finished", &label);
       }
-      Err(e) => {
-        log(format!("render {} failed: {e}", f.id));
-        notify::post(&f.id, "Render failed", e);
+      (Task::Render, Err(e)) => {
+        log(format!("render {label} failed: {e}"));
+        notify::post(&f.job.id, "Render failed", e);
+      }
+      (Task::Prepare, Ok(path)) => log(format!("prepare {} done: {path}", f.job.id)),
+      (Task::Prepare, Err(e)) => {
+        log(format!("prepare {} failed: {e}", f.job.id));
+        notify::post(&f.job.id, "Preview failed", e);
+      }
+    }
+    if f.job.task == Task::Prepare {
+      let mtm = MainThreadMarker::new().expect("main thread");
+      if let Some(w) = &mut self.compose {
+        w.preview_ready(&f.job.id, &f.result, mtm);
+      }
+      let waiting = self
+        .open_when_prepared
+        .take_if(|(id, _)| *id == f.job.id)
+        .map(|(_, mode)| mode);
+      match (waiting, &f.result) {
+        (Some(OnStop::Editor), Ok(_)) => self.open_compose(Some(&f.job.id)),
+        (Some(OnStop::Scrub), Ok(_)) => notify::post(
+          &f.job.id,
+          "Preview ready",
+          &format!("{}: pick slices and render in Compose.", f.job.id),
+        ),
+        _ => {}
       }
     }
     self.show_render_state();
+  }
+
+  fn open_compose(&mut self, id: Option<&str>) {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let w = self
+      .compose
+      .get_or_insert_with(|| compose_window::ComposeWindow::new(mtm));
+    w.show(mtm);
+    if let Some(id) = id {
+      w.select(id);
+    }
   }
 
   fn show_render_state(&self) {
@@ -503,16 +579,24 @@ impl App {
     let s = q.status();
     let text = match (&s.rendering, &s.last) {
       (Some(r), _) if s.queued.is_empty() => {
-        format!("Rendering {}: {:.0}%", r.id, r.progress * 100.0)
+        format!("Rendering {}: {:.0}%", r.job.label(), r.progress * 100.0)
       }
       (Some(r), _) => format!(
         "Rendering {}: {:.0}%, {} queued",
-        r.id,
+        r.job.label(),
         r.progress * 100.0,
         s.queued.len()
       ),
-      (None, Some(Finished { id, result: Ok(_) })) => format!("Last render: {id}"),
-      (None, Some(Finished { id, result: Err(_) })) => format!("Last render failed: {id}"),
+      (None, Some(Finished { job, result: Ok(_) })) => format!("Last: {}", job.label()),
+      (
+        None,
+        Some(Finished {
+          job,
+          result: Err(_),
+        }),
+      ) => {
+        format!("Failed: {}", job.label())
+      }
       (None, None) => "No renders yet".into(),
     };
     tray.render_state.set_text(text);
@@ -521,12 +605,13 @@ impl App {
     tray.last.set_enabled(self.last_id.is_some());
     let Some(id) = &self.last_id else { return };
     let dir = paths::recordings().join(id);
+    let renders = |j: &Job| j.id == *id && j.task == Task::Render;
     let (label, ready) = match &s.rendering {
-      Some(r) if r.id == *id => (
+      Some(r) if renders(&r.job) => (
         format!("Play Render (rendering {:.0}%)", r.progress * 100.0),
         false,
       ),
-      _ if s.queued.contains(id) => ("Play Render (queued)".into(), false),
+      _ if s.queued.iter().any(renders) => ("Play Render (queued)".into(), false),
       _ if dir.join("render.mp4").is_file() => ("Play Render".into(), true),
       _ => ("Play Render (not rendered)".into(), false),
     };
@@ -566,13 +651,8 @@ impl App {
       LastAction::Folder => Some(dir),
       LastAction::Render => Some(dir.join("render.mp4")),
       LastAction::Raw => first_raw(&dir),
-      LastAction::Gif => {
-        let mtm = MainThreadMarker::new().expect("main thread");
-        let gif = self
-          .gif
-          .get_or_insert_with(|| gif_window::GifWindow::new(mtm));
-        gif.show(mtm);
-        gif.select(&id);
+      LastAction::Compose => {
+        self.open_compose(Some(&id));
         None
       }
     };
@@ -661,7 +741,7 @@ impl App {
       (tray.last_folder.id(), LastAction::Folder),
       (tray.last_render.id(), LastAction::Render),
       (tray.last_raw.id(), LastAction::Raw),
-      (tray.last_gif.id(), LastAction::Gif),
+      (tray.last_compose.id(), LastAction::Compose),
     ]
     .into_iter()
     .find(|(id, _)| event.id == **id)
@@ -670,12 +750,8 @@ impl App {
       self.open_last(action);
       return;
     }
-    if event.id == *tray.make_gif.id() {
-      let mtm = MainThreadMarker::new().expect("main thread");
-      self
-        .gif
-        .get_or_insert_with(|| gif_window::GifWindow::new(mtm))
-        .show(mtm);
+    if event.id == *tray.compose.id() {
+      self.open_compose(None);
       return;
     }
     if event.id == *tray.settings.id() {
@@ -708,12 +784,19 @@ impl ApplicationHandler<UserEvent> for App {
             .get_or_insert_with(|| render_panel::RenderPanel::new(mtm))
             .update(&q.status(), mtm);
         }
-        if let Some(g) = &mut self.gif {
+        let mut asked = Vec::new();
+        if let Some(w) = &mut self.compose {
           let mtm = MainThreadMarker::new().expect("main thread");
-          g.tick(mtm);
+          w.tick(mtm);
+          asked = w.take_jobs();
         }
         if let Some(id) = self.settings.as_mut().and_then(|s| s.tick()) {
-          let _ = self.handle_request(Request::Render { id });
+          asked.push(Job::prepare(&id));
+        }
+        for work in asked {
+          if let Err(e) = self.queue_job(work) {
+            log(format!("queue: {e}"));
+          }
         }
         if self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
           self.sweep();
@@ -730,12 +813,12 @@ impl ApplicationHandler<UserEvent> for App {
       .as_ref()
       .is_some_and(|q| q.status().rendering.is_some())
       || self.panel.as_ref().is_some_and(|p| p.is_active());
-    let gif_open = self.gif.as_ref().is_some_and(|g| g.is_visible())
+    let window_open = self.compose.as_ref().is_some_and(|g| g.is_visible())
       || self.settings.as_ref().is_some_and(|s| s.is_visible());
     let period = if self.overlay.is_some() {
       OVERLAY_TICK
-    } else if gif_open {
-      GIF_WINDOW_TICK
+    } else if window_open {
+      COMPOSE_WINDOW_TICK
     } else if self.recorder.is_some() {
       RECORDING_TICK
     } else if rendering {
@@ -767,7 +850,7 @@ enum LastAction {
   Folder,
   Render,
   Raw,
-  Gif,
+  Compose,
 }
 
 /// The first segment's raw capture, which is the one a player can open on its own.
@@ -800,7 +883,8 @@ fn main() {
     last_disk_check: None,
     hotkeys: None,
     overlay: None,
-    gif: None,
+    compose: None,
+    open_when_prepared: None,
     settings: None,
     panel: None,
     last_id: None,

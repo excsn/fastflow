@@ -290,6 +290,14 @@ pub const GROUPS: &[Group] = &[
         Kind::Number,
         "How long the cross-dissolve takes when the recording moves to another display.",
       ),
+      field(
+        "render",
+        "on_stop",
+        "When a recording stops",
+        "",
+        Kind::Choice(&["editor", "scrub", "none"]),
+        "Nothing renders by itself. editor prepares the scrub preview and opens the composition window, where you pick slices and press Render. scrub prepares the preview and posts a notification. none prepares nothing.",
+      ),
     ],
   },
 ];

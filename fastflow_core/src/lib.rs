@@ -4,4 +4,5 @@ pub mod diagram;
 pub mod geom;
 pub mod markers;
 pub mod recording;
+pub mod slices;
 pub mod timeline;

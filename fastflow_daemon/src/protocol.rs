@@ -8,9 +8,12 @@ pub enum Request {
   Start,
   Stop,
   Status,
-  /// Queue a render of an existing recording, for after its `config.toml` changed.
+  /// Queue a render of an existing recording. `output` names one output of its `slices.toml`.
+  /// Without it every output is rendered.
   Render {
     id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
   },
   List {
     #[serde(default = "default_limit")]
@@ -71,16 +74,65 @@ pub struct Status {
   pub last: Option<Finished>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Task {
+  /// Build the proxy and the scrub file.
+  Prepare,
+  #[default]
+  Render,
+}
+
+/// One piece of work for the render queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Job {
+  pub id: String,
+  #[serde(default)]
+  pub task: Task,
+  /// For a render, the output to render. `None` renders every output.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub output: Option<String>,
+}
+
+impl Job {
+  pub fn prepare(id: &str) -> Job {
+    Job {
+      id: id.to_owned(),
+      task: Task::Prepare,
+      output: None,
+    }
+  }
+
+  pub fn render(id: &str, output: Option<&str>) -> Job {
+    Job {
+      id: id.to_owned(),
+      task: Task::Render,
+      output: output.map(str::to_owned),
+    }
+  }
+
+  /// How the job reads in a status line.
+  pub fn label(&self) -> String {
+    match (self.task, &self.output) {
+      (Task::Prepare, _) => format!("preparing {}", self.id),
+      (Task::Render, None) => self.id.clone(),
+      (Task::Render, Some(o)) => format!("{} {o}", self.id),
+    }
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rendering {
-  pub id: String,
+  #[serde(flatten)]
+  pub job: Job,
   /// 0 to 1.
   pub progress: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Finished {
-  pub id: String,
+  #[serde(flatten)]
+  pub job: Job,
   /// `Ok` holds the rendered file. `Err` holds why the render failed.
   pub result: Result<String, String>,
 }
@@ -103,7 +155,16 @@ mod tests {
     assert_eq!(
       r,
       Request::Render {
-        id: "2026-09-25-210217".into()
+        id: "2026-09-25-210217".into(),
+        output: None,
+      }
+    );
+    let r: Request = serde_json::from_str(r#"{"cmd":"render","id":"x","output":"demo"}"#).unwrap();
+    assert_eq!(
+      r,
+      Request::Render {
+        id: "x".into(),
+        output: Some("demo".into()),
       }
     );
     let r: Request = serde_json::from_str(r#"{"cmd":"list"}"#).unwrap();

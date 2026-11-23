@@ -42,15 +42,16 @@ An ad-hoc build needs the grants again after every rebuild; set `FASTFLOW_SIGN_I
 | You want to | Use |
 |---|---|
 | Record | the menu bar item, ⌃⌥⌘R or `fastflow start` / `fastflow stop` |
-| Get the finished video | nothing: stopping queues a render to `render.mp4`, with a notification when it is done |
+| Get the finished video | Compose… opens when a recording stops. Press Render for `render.mp4`. Nothing renders by itself |
+| Show only some parts, in any order | add slices in Compose… and list them in an output. They live in the recording's `slices.toml` |
 | Keep a slow stretch at full speed | ⌃⌥⌘K at its start and end while recording |
 | Skip quickly past a detour | ⌃⌥⌘X at its start and end while recording |
-| Change pacing, camera or blur | Settings… in the menu bar. Apply to Last Recording re-renders it |
+| Change pacing, camera or blur | Settings… in the menu bar. Apply to Last Recording updates its preview |
 | Change one older recording | `config.toml` in its folder, then `fastflow render <id>` |
 | Try settings quickly | `fastflow preview <id>`, a half-size render from the proxy in seconds |
 | See why the output looks the way it does | `fastflow diagram <id>` |
 | Check what the camera saw | `fastflow render <dir> --boxes` |
-| Share a clip as an animated GIF or WebP | Make GIF… in the menu bar. `fastflow gif <id>` from a script |
+| Share a clip as an animated GIF or WebP | a GIF or WebP output in Compose…. From a script, `fastflow render <id> --slice 42-58 --format gif` |
 | Keep a recording's raw footage past 7 days | `fastflow pin <id>` |
 
 Recordings live in `~/Movies/fastflow/<timestamp>/`. The app log is `~/Library/Logs/fastflow/fastflow.log`.

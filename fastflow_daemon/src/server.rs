@@ -81,7 +81,7 @@ mod tests {
           status: Some(Status::default()),
           ..Response::ok()
         },
-        Request::Render { id } => Response::with_id(id),
+        Request::Render { id, .. } => Response::with_id(id),
         _ => Response::error("unsupported"),
       }
     }
@@ -95,7 +95,14 @@ mod tests {
     fs::write(&path, b"").unwrap();
 
     serve(&path, Arc::new(Echo)).unwrap();
-    let r = request(&path, &Request::Render { id: "abc".into() }).unwrap();
+    let r = request(
+      &path,
+      &Request::Render {
+        id: "abc".into(),
+        output: None,
+      },
+    )
+    .unwrap();
     assert_eq!(r, Response::with_id("abc"));
     assert!(request(&path, &Request::Status).unwrap().status.is_some());
     assert!(serve(&path, Arc::new(Echo)).is_err());

@@ -10,7 +10,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use fastflow_daemon::paths;
-use fastflow_daemon::protocol::Finished;
+use fastflow_daemon::protocol::{Finished, Job, Task};
 use fastflow_daemon::queue::QueueStatus;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -54,7 +54,7 @@ impl PanelTarget {
 
 enum Showing {
   Nothing,
-  Rendering { id: String, started: Instant },
+  Rendering { job: Job, started: Instant },
   Done { finished: Finished, at: Instant },
 }
 
@@ -153,22 +153,24 @@ impl RenderPanel {
       self.open();
     }
     let now = Instant::now();
-    if let Some(r) = &s.rendering {
+    let rendering = s.rendering.as_ref().filter(|r| r.job.task == Task::Render);
+    if let Some(r) = rendering {
       let started = match &self.showing {
-        Showing::Rendering { id, started } if *id == r.id => *started,
+        Showing::Rendering { job, started } if *job == r.job => *started,
         _ => {
           self.showing = Showing::Rendering {
-            id: r.id.clone(),
+            job: r.job.clone(),
             started: now,
           };
           self.present(mtm);
           now
         }
       };
-      self.show_progress(&r.id, r.progress, now - started, s.queued.len());
-    } else if let Showing::Rendering { id, .. } = &self.showing {
+      let queued = s.queued.iter().filter(|j| j.task == Task::Render).count();
+      self.show_progress(&r.job.label(), r.progress, now - started, queued);
+    } else if let Showing::Rendering { job, .. } = &self.showing {
       match &s.last {
-        Some(f) if f.id == *id => {
+        Some(f) if f.job == *job => {
           self.show_done(f);
           self.showing = Showing::Done {
             finished: f.clone(),
@@ -187,8 +189,8 @@ impl RenderPanel {
   fn current_id(&self) -> Option<String> {
     match &self.showing {
       Showing::Nothing => None,
-      Showing::Rendering { id, .. } => Some(id.clone()),
-      Showing::Done { finished, .. } => Some(finished.id.clone()),
+      Showing::Rendering { job, .. } => Some(job.id.clone()),
+      Showing::Done { finished, .. } => Some(finished.job.id.clone()),
     }
   }
 
@@ -204,8 +206,8 @@ impl RenderPanel {
     self.panel.orderFrontRegardless();
   }
 
-  fn show_progress(&self, id: &str, progress: f64, elapsed: Duration, queued: usize) {
-    self.set(&self.title, &format!("Rendering {id}"));
+  fn show_progress(&self, label: &str, progress: f64, elapsed: Duration, queued: usize) {
+    self.set(&self.title, &format!("Rendering {label}"));
     self.bar.setDoubleValue(progress);
     let mut parts = vec![format!("{:.0}%", progress * 100.0)];
     if progress >= ESTIMATE_FROM {
@@ -222,13 +224,13 @@ impl RenderPanel {
   fn show_done(&self, f: &Finished) {
     match &f.result {
       Ok(_) => {
-        self.set(&self.title, &format!("Rendered {}", f.id));
+        self.set(&self.title, &format!("Rendered {}", f.job.label()));
         self.bar.setDoubleValue(1.0);
         self.set(&self.detail, "Done");
         self.button.setTitle(&NSString::from_str("Show Render"));
       }
       Err(e) => {
-        self.set(&self.title, &format!("Render failed: {}", f.id));
+        self.set(&self.title, &format!("Render failed: {}", f.job.label()));
         self.set(&self.detail, e);
         self.button.setTitle(&NSString::from_str("Open Folder"));
       }

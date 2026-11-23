@@ -12,7 +12,7 @@ The design of the first version as built: what fastflow does to a recording and 
 * [Mission Control](#mission-control)
 * [Displays](#displays)
 * [Rendering](#rendering)
-* [Clips](#clips)
+* [Slices](#slices)
 * [The app](#the-app)
 * [Settings](#settings)
 * [Open questions](#open-questions)
@@ -82,25 +82,31 @@ A recording follows the cursor from display to display as separate segments, one
 
 ## Rendering
 
-The compositor makes one forward pass. For each output frame it asks the timeline for a source time, decodes forward to it, crops the camera rect in floating point with Lanczos and applies focus. It never seeks per frame, since each seek would decode from the previous keyframe and turn a linear render quadratic. Integer-snapped crops make camera motion stutter, so the crop box stays subpixel. The output is H.264 through ffmpeg at the output size, 1920x1080 at 60fps by default.
+The compositor makes one forward pass. For each output frame it asks the timeline for a source time, decodes forward to it, crops the camera rect in floating point with Lanczos and applies focus. It never seeks per frame, since each seek would decode from the previous keyframe and turn a linear render quadratic. A render of slices restarts a decoder at most once per slice: where the slice starts behind the decoder or more than two seconds ahead of it. Integer-snapped crops make camera motion stutter, so the crop box stays subpixel. The output is H.264 through ffmpeg at the output size, 1920x1080 at 60fps by default.
 
 With the camera off, ffmpeg scales and pads each frame while decoding, since piping native frames would move about 34MB per frame.
 
-After each render the app writes a 960-wide proxy. A preview plans the tracks exactly as the final render does and only decodes the proxy at half size, so it shows the same pacing and framing in seconds.
+When a recording stops the app writes a 960-wide proxy, then `scrub.mp4` from it: the whole recording at 640 wide and 10fps with pacing, camera and focus applied and every frame a keyframe. It takes about a second per 20 seconds of output. A preview plans the tracks exactly as the final render does and only decodes the proxy at half size, so it shows the same pacing and framing in seconds.
 
-## Clips
+## Slices
 
-Make GIF… turns a stretch of the rendered, raw or preview video into an animated GIF or WebP. A two-handled slider sets the range while the player loops it at the chosen speed. The file size is estimated by encoding two seconds from the middle of the range and scaling up. The estimate refreshes half a second after the settings stop changing.
+Nothing renders until it is asked for. A recording's `slices.toml` names slices and outputs. A slice is a range in source seconds. An output plays a list of slices in order as an mp4, GIF or WebP. Each slice plays at most once in an output. An output with an empty list plays the whole recording. A recording without the file has one mp4 output named `render` with an empty list.
+
+A slice is a window of the whole recording's timeline, so it is paced, framed and focused exactly as the full render is at that moment. At a join the camera cuts to where it was at that point. An output's `dissolve_ms` cross-dissolves each join and shortens the output by that much.
+
+Compose… edits the file. Its player shows `scrub.mp4`. Every slice is a band on one track laid out in output time. Slices that overlap are drawn in separate lanes. Dragging across empty track makes a slice and dragging a band's edge or middle changes it. Double-clicking a band adds it to the chosen output or takes it out. Beside the track the slice list renames and deletes slices. The play list shows the chosen output's slices in order. Rows are dragged to reorder them and slices are dragged in from the slice list. A slice is saved in source seconds. Play Output jumps the player from slice to slice. A GIF or WebP size is estimated by encoding two seconds of the scrub file and scaling up.
+
+A GIF or WebP output is rendered at its own width and frame rate to an intermediate mp4, then converted:
 
 - **GIF** goes through ffmpeg's palette pair. One pass builds a palette from the clip. The next maps frames onto it with ordered dithering and redraws only the rectangle that changed, which is most of the saving on screen content.
 - **WebP** frames are written by ffmpeg and assembled by `img2webp`, since Homebrew's ffmpeg has no WebP encoder. Identical frames merge. On screen recordings it is usually several times smaller than the GIF.
-- **Size** falls fastest with a shorter range, then a higher speed, a lower frame rate and a smaller width.
+- **Size** falls fastest with fewer and shorter slices, then a lower frame rate and a smaller width.
 
 ## The app
 
 - **Packaging.** Screen Recording and Input Monitoring grants belong to an app's code signature, so fastflow is a background-only `.app` with a menu bar item, installed to `/Applications` and built from source on the Mac that runs it. An ad-hoc signature changes on every rebuild and loses the grants.
 - **Setup.** A setup window resets stale grants with `tccutil`, requests Input Monitoring before Screen Recording and offers one restart, since neither grant takes effect in a running process.
-- **Daemon.** The app owns recording and a render queue behind a unix socket. The tray and the CLI are both clients. Stopping a recording queues its render.
+- **Daemon.** The app owns recording and a render queue behind a unix socket. The tray and the CLI are both clients. Stopping a recording queues the proxy and scrub file and, with `render.on_stop = "editor"`, opens Compose… when they are ready.
 - **Recovery.** A recording left behind by a dead instance is found at launch by its `state.json`. An orphaned ffmpeg is stopped, the segment's length is read from the fragmented file and the recording is marked recovered. It is never rendered automatically.
 - **Retention.** Raw footage is deleted 7 days after its render unless the recording is pinned. Recording is refused below 5GB free, warned below 20GB and stopped cleanly below 2GB.
 

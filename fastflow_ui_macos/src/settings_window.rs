@@ -1,5 +1,6 @@
 //! "Settings…": one tab per group of `config.toml` settings. Saving writes the defaults every new
-//! recording copies. Applying also writes them into the last recording and re-renders it.
+//! recording copies. Applying also writes them into the last recording and rebuilds its scrub
+//! preview.
 
 use std::cell::Cell;
 
@@ -210,7 +211,7 @@ impl SettingsWindow {
     self.window.isVisible()
   }
 
-  /// Handles a pressed button. Returns a recording to re-render.
+  /// Handles a pressed button. Returns a recording whose scrub preview is now stale.
   pub fn tick(&mut self) -> Option<String> {
     let action = self.target.ivars().take()?;
     if let Action::Help(i) = action {
@@ -253,7 +254,10 @@ impl SettingsWindow {
       return None;
     }
     log(format!("settings applied to {}", last.id));
-    self.say(&format!("Saved. Re-rendering {}.", last.id), false);
+    self.say(
+      &format!("Saved. Updating the preview of {}.", last.id),
+      false,
+    );
     Some(last.id)
   }
 

@@ -183,6 +183,27 @@ pub fn transcode_proxy(src: &Path, out: &Path, (w, h): (u32, u32), fps: u32) -> 
   }
 }
 
+/// How the encoder trades size for quality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+  /// A finished video.
+  Final,
+  /// Every frame a keyframe, so a player lands on any frame without decoding up to it.
+  Scrub,
+  /// Near lossless, for a file another encoder reads next.
+  Intermediate,
+}
+
+impl Encoding {
+  fn args(self) -> &'static [&'static str] {
+    match self {
+      Encoding::Final => &["-b:v", "12M"],
+      Encoding::Scrub => &["-q:v", "60", "-g", "1"],
+      Encoding::Intermediate => &["-q:v", "90"],
+    }
+  }
+}
+
 pub struct FfmpegSink {
   child: Child,
   stdin: Option<ChildStdin>,
@@ -191,7 +212,13 @@ pub struct FfmpegSink {
 
 impl FfmpegSink {
   /// `chapters` is an ffmetadata file whose chapters are copied into the output.
-  pub fn create(path: &Path, size: (u32, u32), fps: u32, chapters: Option<&Path>) -> Result<Self> {
+  pub fn create(
+    path: &Path,
+    size: (u32, u32),
+    fps: u32,
+    chapters: Option<&Path>,
+    encoding: Encoding,
+  ) -> Result<Self> {
     let bin = locate()?;
     let mut cmd = Command::new(bin);
     cmd
@@ -206,15 +233,9 @@ impl FfmpegSink {
         .args(["-map", "0:v", "-map_chapters", "1"]);
     }
     let mut child = cmd
-      .args([
-        "-c:v",
-        "h264_videotoolbox",
-        "-b:v",
-        "12M",
-        "-pix_fmt",
-        "yuv420p",
-      ])
-      .args(["-movflags", "+faststart"])
+      .args(["-c:v", "h264_videotoolbox"])
+      .args(encoding.args())
+      .args(["-pix_fmt", "yuv420p", "-movflags", "+faststart"])
       .arg(path)
       .stdin(Stdio::piped())
       .stdout(Stdio::null())

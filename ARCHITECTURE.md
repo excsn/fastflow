@@ -27,7 +27,9 @@ fastflow captures once and edits afterwards. A recording is the untouched screen
 ├─ config.toml     copied from the defaults at record time
 ├─ state.json      present only while recording
 ├─ proxy.mp4       960 wide, 30fps, for previews
-└─ render.mp4      the output
+├─ scrub.mp4       640 wide, 10fps, paced and framed, every frame a keyframe, for Compose…
+├─ slices.toml     named source ranges and the outputs that play them, absent until edited
+└─ render.mp4      an output, named after it: render.mp4, demo.gif
 ```
 
 Two contracts hold across every backend:
@@ -44,13 +46,15 @@ The recorder in `fastflow_ui_macos/src/recorder.rs` runs the capture session, a 
 1. `Timeline::build_with` turns input times into spans: human spans at full speed, ramps easing up to `ramp_speed`, idle middles capped at `max_dead`. Keep and Cut markers override the automatic spans.
 2. Per segment, `CameraTrack::build` feeds the window samples to a `Director`, which debounces the subject under the cursor and emits decisions. Moves are placed in output time with `plan_move`. Mission Control pauses the director, blurs everything and commits to the frontmost window when it closes.
 
-`job::run` then opens an ffmpeg decoder per segment and drives `compositor::render_segments`: for each output frame it asks the timeline for a source time, decodes forward to it, crops the camera rect with Lanczos, applies the focus blur and writes RGBA to an ffmpeg encoder. Segment boundaries cross-dissolve. Decoding never seeks, so a render is one forward pass.
+`job::run` then opens an ffmpeg decoder per segment and drives `compositor::render_segments`: for each output frame it asks the timeline for a source time, decodes forward to it, crops the camera rect with Lanczos, applies the focus blur and writes RGBA to an ffmpeg encoder. Segment boundaries cross-dissolve. Decoding never seeks within a slice, so the whole recording renders in one forward pass.
+
+An output of several slices is laid out by `slices::Projection`. Each slice is a window of the whole recording's timeline, so every frame is composed at a full-timeline output time and pacing, camera and focus match the full render. A decoder restarts once where a slice starts behind it or far ahead. A dissolve between two slices of one segment reads the second position from a spare decoder.
 
 The live overlay feeds the same `Director` and `plan_move` in wall-clock time, so it cannot disagree with the render about when the camera commits.
 
 ## The app
 
-The tray, the socket and hotkeys all end up on the main thread through the winit event loop, where the recorder lives. Renders run one at a time on the queue's worker thread. The socket is `~/Library/Application Support/com.excsn.mac.fastflow/sock`, newline-delimited json. At launch the app recovers recordings a dead instance left behind and sweeps raw footage kept 7 days past its render. It opens the setup window if a grant is missing.
+The tray, the socket and hotkeys all end up on the main thread through the winit event loop, where the recorder lives. The queue's worker thread runs one job at a time. A job either prepares a recording's proxy and scrub file or renders its outputs. Stopping a recording only prepares. Rendering waits for Compose…, the CLI or the socket. The socket is `~/Library/Application Support/com.excsn.mac.fastflow/sock`, newline-delimited json. At launch the app recovers recordings a dead instance left behind and sweeps raw footage kept 7 days past its render. It opens the setup window if a grant is missing.
 
 ## Testing
 

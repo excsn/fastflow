@@ -1,6 +1,8 @@
 //! Renders a recording directory end to end. Shared by the CLI and the daemon.
 
 use std::fs;
+use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -9,10 +11,12 @@ use fastflow_core::config::Config;
 use fastflow_core::geom::Rect;
 use fastflow_core::markers::Markers;
 use fastflow_core::recording::{InputEvent, Meta, SegmentInfo, WindowSample};
+use fastflow_core::slices::{Format, Output, Projection, Slices};
 use fastflow_core::timeline::{SpanKind, Timeline};
 
 use crate::compositor::{self, Framing, RenderSettings, Segment};
-use crate::ffmpeg::{Decode, FfmpegSink, FfmpegSource};
+use crate::export::{self, ExportSpec};
+use crate::ffmpeg::{Decode, Encoding, FfmpegSink, FfmpegSource};
 use crate::focus::{FocusBlur, FocusMask, FocusSettings};
 use crate::overlay::{self, Letterbox};
 use crate::{Frame, FrameSink};
@@ -22,6 +26,7 @@ type Draw<'a> = Box<dyn FnMut(&mut Frame, f64, f64) -> crate::Result<()> + 'a>;
 pub struct RenderJob {
   pub dir: PathBuf,
   pub out: PathBuf,
+  pub target: Target,
   /// Draw the camera's inputs over the whole frame instead of cropping.
   pub boxes: bool,
   /// Read `proxy.mp4` and write a half-size, 30fps preview. The tracks are planned exactly as
@@ -254,6 +259,134 @@ pub fn plan(dir: &Path, log: &mut dyn FnMut(String)) -> Result<Plan, String> {
   })
 }
 
+/// What a render produces: slices of the recording in one format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+  pub format: Format,
+  /// Source ranges in playing order. `None` is the whole recording.
+  pub ranges: Option<Vec<Range<f64>>>,
+  /// Pixels. Height follows the aspect of `output.size`.
+  pub width: Option<u32>,
+  pub fps: Option<u32>,
+  pub colors: Option<u32>,
+  pub quality: Option<u32>,
+  pub dissolve_ms: u32,
+}
+
+impl Target {
+  pub fn whole() -> Target {
+    Target {
+      format: Format::Mp4,
+      ranges: None,
+      width: None,
+      fps: None,
+      colors: None,
+      quality: None,
+      dissolve_ms: 0,
+    }
+  }
+
+  pub fn of(slices: &Slices, output: &Output) -> Target {
+    Target {
+      format: output.format,
+      ranges: slices.ranges(output),
+      width: output.width,
+      fps: output.fps,
+      colors: output.colors,
+      quality: output.quality,
+      dissolve_ms: output.dissolve_ms,
+    }
+  }
+}
+
+pub const SLICES_FILE: &str = "slices.toml";
+pub const SCRUB_FILE: &str = "scrub.mp4";
+const SCRUB_STAMP: &str = "scrub.stamp";
+const SCRUB_WIDTH: u32 = 640;
+const SCRUB_FPS: u32 = 10;
+const ANIMATION_WIDTH: u32 = 800;
+const ANIMATION_FPS: u32 = 15;
+
+/// Source seconds the recording runs for, from `meta.json`.
+pub fn duration(dir: &Path) -> Result<f64, String> {
+  let meta: Meta = read_json(&dir.join("meta.json"))?;
+  let last = meta.segments.last().ok_or("meta.json lists no segments")?;
+  last.end_ms.map(|ms| ms as f64 / 1000.0).ok_or_else(|| {
+    "meta.json has no end time for the last segment; the recording did not finish".into()
+  })
+}
+
+/// `slices.toml` or the implicit single output when there is none. Files from before outputs
+/// could play the whole recording are migrated in memory. Always validated.
+pub fn load_slices(dir: &Path) -> Result<Slices, String> {
+  let duration = duration(dir)?;
+  let path = dir.join(SLICES_FILE);
+  let mut slices: Slices = match fs::read_to_string(&path) {
+    Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Slices::implicit(),
+    Err(e) => return Err(format!("{}: {e}", path.display())),
+  };
+  slices.migrate(duration);
+  slices
+    .validate(duration)
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+  Ok(slices)
+}
+
+pub fn save_slices(dir: &Path, slices: &Slices) -> Result<(), String> {
+  slices.validate(duration(dir)?)?;
+  let text = toml::to_string(slices).map_err(|e| e.to_string())?;
+  let path = dir.join(SLICES_FILE);
+  fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub fn output_path(dir: &Path, output: &Output) -> PathBuf {
+  dir.join(output.file_name())
+}
+
+/// The job for one named output of `slices.toml`.
+pub fn output_job(dir: &Path, name: &str) -> Result<RenderJob, String> {
+  let slices = load_slices(dir)?;
+  let output = slices.output(name).ok_or_else(|| {
+    format!(
+      "no output named {name:?} in {}",
+      dir.join(SLICES_FILE).display()
+    )
+  })?;
+  Ok(RenderJob {
+    dir: dir.to_owned(),
+    out: output_path(dir, output),
+    boxes: false,
+    preview: false,
+    target: Target::of(&slices, output),
+  })
+}
+
+fn even(v: f64) -> u32 {
+  ((v / 2.0).round() as u32 * 2).max(2)
+}
+
+/// Pixel size with `width` and the aspect of `full`.
+fn sized(full: [u32; 2], width: u32) -> (u32, u32) {
+  (
+    even(width as f64),
+    even(width as f64 * full[1] as f64 / full[0] as f64),
+  )
+}
+
+/// How one render reads and writes, after the job's defaults are resolved.
+struct Pass<'a> {
+  out: &'a Path,
+  size: (u32, u32),
+  fps: u32,
+  proxy: bool,
+  boxes: bool,
+  ranges: Option<&'a [Range<f64>]>,
+  dissolve: f64,
+  encoding: Encoding,
+  chapters: bool,
+}
+
 /// Renders `job.dir` to `job.out`. `log` receives the summary lines, `progress` frames done and
 /// the total.
 pub fn run(
@@ -261,34 +394,142 @@ pub fn run(
   log: &mut dyn FnMut(String),
   progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Report, String> {
-  let (dir, out) = (job.dir.as_path(), job.out.as_path());
+  let started = Instant::now();
+  let plan = plan(&job.dir, log)?;
+  let t = &job.target;
+  let animation = t.format.is_animation() && !job.preview;
+  let cfg_size = plan.cfg.output.size;
+  let (mut size, mut fps) = if animation {
+    (
+      sized(cfg_size, t.width.unwrap_or(ANIMATION_WIDTH)),
+      t.fps.unwrap_or(ANIMATION_FPS),
+    )
+  } else {
+    (
+      t.width
+        .map_or((cfg_size[0], cfg_size[1]), |w| sized(cfg_size, w)),
+      t.fps.unwrap_or(plan.cfg.output.fps),
+    )
+  };
+  if job.preview {
+    size = (even(size.0 as f64 / 2.0), even(size.1 as f64 / 2.0));
+    fps = PREVIEW_FPS;
+  }
+  let intermediate = job.out.with_extension("tmp.mp4");
+  let pass = Pass {
+    out: if animation { &intermediate } else { &job.out },
+    size,
+    fps,
+    proxy: job.preview,
+    boxes: job.boxes,
+    ranges: t.ranges.as_deref(),
+    dissolve: t.dissolve_ms as f64 / 1000.0,
+    encoding: if animation {
+      Encoding::Intermediate
+    } else {
+      Encoding::Final
+    },
+    chapters: !animation,
+  };
+  if !animation {
+    let frames = render_plan(&job.dir, &plan, &pass, log, progress)?;
+    return Ok(Report {
+      out: job.out.clone(),
+      frames,
+      seconds: started.elapsed().as_secs_f64(),
+    });
+  }
+
+  let mut total = 0;
+  let rendered = render_plan(&job.dir, &plan, &pass, log, &mut |done, all| {
+    total = all + all / 9;
+    progress(done, total);
+  });
+  let frames = match rendered {
+    Ok(f) => f,
+    Err(e) => {
+      let _ = fs::remove_file(&intermediate);
+      return Err(e);
+    }
+  };
+  let spec = ExportSpec {
+    src: intermediate.clone(),
+    from: 0.0,
+    to: frames as f64 / fps as f64,
+    speed: 1.0,
+    fps,
+    width: size.0,
+    colors: t.colors.unwrap_or(128),
+    quality: t.quality.unwrap_or(70),
+    format: match t.format {
+      Format::Webp => export::Format::Webp,
+      _ => export::Format::Gif,
+    },
+    out: job.out.clone(),
+  };
+  let exported = export::export(&spec, &mut |p| {
+    progress(frames + ((total - frames) as f64 * p) as u64, total)
+  });
+  let _ = fs::remove_file(&intermediate);
+  exported.map_err(|e| e.to_string())?;
+  Ok(Report {
+    out: job.out.clone(),
+    frames,
+    seconds: started.elapsed().as_secs_f64(),
+  })
+}
+
+fn render_plan(
+  dir: &Path,
+  plan: &Plan,
+  pass: &Pass,
+  log: &mut dyn FnMut(String),
+  progress: &mut dyn FnMut(u64, u64),
+) -> Result<u64, String> {
   let Plan {
     cfg,
     markers,
     timeline,
     segments: plans,
     ..
-  } = plan(dir, log)?;
-
-  let (size, fps) = if job.preview {
-    (
-      (cfg.output.size[0] / 2, cfg.output.size[1] / 2),
-      PREVIEW_FPS,
-    )
-  } else {
-    ((cfg.output.size[0], cfg.output.size[1]), cfg.output.fps)
-  };
+  } = plan;
+  let size = pass.size;
   let px_scale = size.0 as f64 / cfg.output.size[0] as f64;
-  let cropping = cfg.camera.enabled && !job.boxes;
+  let cropping = cfg.camera.enabled && !pass.boxes;
   let focus_settings = FocusSettings {
     blur: cfg.focus.blur * px_scale,
     dim: cfg.focus.dim,
     feather: cfg.focus.feather * px_scale,
   };
+  let projection = match pass.ranges {
+    Some(ranges) => Projection::new(timeline, ranges, pass.dissolve),
+    None => Projection::whole(timeline),
+  };
+  if projection.windows().is_empty() {
+    return Err("the slices cover no output time".into());
+  }
+  if pass.ranges.is_some() {
+    for (i, w) in projection.windows().iter().enumerate() {
+      log(format!(
+        "slice {i}: output {:.2}s to {:.2}s, full timeline {:.2}s to {:.2}s",
+        w.start,
+        w.end(),
+        w.full.start,
+        w.full.end
+      ));
+    }
+  }
+  let spares_needed = projection.windows().iter().any(|w| w.dissolve_in > 0.0);
 
+  let decode = if cropping {
+    Decode::Native
+  } else {
+    Decode::Fit(size.0, size.1)
+  };
   let mut sources = Vec::with_capacity(plans.len());
+  let mut spares = Vec::with_capacity(plans.len());
   for (i, p) in plans.iter().enumerate() {
-    let (file, decoded) = if job.preview {
+    let (file, decoded) = if pass.proxy {
       let proxy = dir.join(proxy_file(i));
       if !proxy.is_file() {
         return Err(format!("{} has no {} yet", dir.display(), proxy_file(i)));
@@ -302,13 +543,11 @@ pub fn run(
     } else {
       (dir.join(&p.info.file), p.info.clone())
     };
-    let decode = if cropping {
-      Decode::Native
-    } else {
-      Decode::Fit(size.0, size.1)
+    let open = || {
+      FfmpegSource::open(&file, decoded.clone(), decode, pass.fps as f64).map_err(|e| e.to_string())
     };
-    sources
-      .push(FfmpegSource::open(&file, decoded, decode, fps as f64).map_err(|e| e.to_string())?);
+    sources.push(open()?);
+    spares.push(if spares_needed { Some(open()?) } else { None });
   }
 
   let mut draws: Vec<Draw<'_>> = plans
@@ -329,7 +568,7 @@ pub fn run(
       };
       let corner = cfg.focus.corner_radius / p.geo.surface_pt.0;
       let mut focus = FocusBlur::default();
-      let (cfg, focus_settings, boxes) = (&cfg, focus_settings, job.boxes);
+      let boxes = pass.boxes;
       Box::new(move |frame: &mut Frame, out_t: f64, src_t: f64| {
         if cfg.focus.enabled && p.track.focused_at(out_t) {
           let ms = (src_t * 1000.0) as i64;
@@ -374,14 +613,16 @@ pub fn run(
       }) as Draw<'_>
     })
     .collect();
-  let drawing = cfg.focus.enabled || job.boxes;
+  let drawing = cfg.focus.enabled || pass.boxes;
 
   let mut segments: Vec<Segment> = sources
     .iter_mut()
+    .zip(spares.iter_mut())
     .zip(draws.iter_mut())
-    .zip(&plans)
-    .map(|((source, draw), p)| Segment {
+    .zip(plans)
+    .map(|(((source, spare), draw), p)| Segment {
       source,
+      spare: spare.as_mut().map(|s| s as &mut dyn crate::FrameSource),
       framing: if cropping {
         Framing::Camera(&p.track)
       } else {
@@ -392,43 +633,111 @@ pub fn run(
     })
     .collect();
 
+  let out = pass.out;
   let chapters_file = out.with_extension("chapters.txt");
-  let chapters = if markers.chapters.is_empty() {
+  let starts: Vec<i64> = markers
+    .chapters
+    .iter()
+    .filter_map(|&c| projection.project(timeline.out_time_at(c)))
+    .map(|t| (t * 1000.0) as i64)
+    .collect();
+  let chapters = if !pass.chapters || starts.is_empty() {
     None
   } else {
-    let starts: Vec<i64> = markers
-      .chapters
-      .iter()
-      .map(|&c| (timeline.out_time_at(c) * 1000.0) as i64)
-      .collect();
     write_chapters(
       &chapters_file,
       &starts,
-      (timeline.out_duration() * 1000.0) as i64,
+      (projection.duration() * 1000.0) as i64,
     )?;
     Some(chapters_file.as_path())
   };
-  let mut sink = Box::new(FfmpegSink::create(out, size, fps, chapters).map_err(|e| e.to_string())?);
+  let mut sink = Box::new(
+    FfmpegSink::create(out, size, pass.fps, chapters, pass.encoding).map_err(|e| e.to_string())?,
+  );
 
-  let started = Instant::now();
-  let frames = compositor::render_segments(
+  let rendered = compositor::render_projection(
     &mut segments,
     sink.as_mut(),
-    &timeline,
+    timeline,
+    &projection,
     cfg.render.switch_ms as f64 / 1000.0,
-    RenderSettings { size, fps },
+    RenderSettings {
+      size,
+      fps: pass.fps,
+    },
     progress,
   )
-  .map_err(|e| e.to_string())?;
-  sink.finish().map_err(|e| e.to_string())?;
+  .map_err(|e| e.to_string());
+  let finished = sink.finish().map_err(|e| e.to_string());
   if chapters.is_some() {
     let _ = fs::remove_file(&chapters_file);
   }
-  Ok(Report {
-    out: out.to_owned(),
-    frames,
-    seconds: started.elapsed().as_secs_f64(),
-  })
+  let frames = rendered?;
+  finished?;
+  Ok(frames)
+}
+
+/// What the scrub file was built from. A change to any of these makes it stale.
+fn scrub_stamp(dir: &Path) -> String {
+  let mut h = std::hash::DefaultHasher::new();
+  for name in ["meta.json", "config.toml", "input.jsonl", "windows.jsonl"] {
+    name.hash(&mut h);
+    fs::read(dir.join(name)).unwrap_or_default().hash(&mut h);
+  }
+  (SCRUB_WIDTH, SCRUB_FPS).hash(&mut h);
+  format!("{:016x}", h.finish())
+}
+
+pub fn scrub_is_current(dir: &Path) -> bool {
+  dir.join(SCRUB_FILE).is_file()
+    && fs::read_to_string(dir.join(SCRUB_STAMP)).is_ok_and(|s| s.trim() == scrub_stamp(dir))
+}
+
+/// Renders `scrub.mp4` from the proxy: the whole recording, paced, with the camera and focus,
+/// small and with every frame a keyframe. Its time is the full timeline's output time.
+pub fn make_scrub(
+  dir: &Path,
+  log: &mut dyn FnMut(String),
+  progress: &mut dyn FnMut(u64, u64),
+) -> Result<PathBuf, String> {
+  let plan = plan(dir, log)?;
+  let out = dir.join(SCRUB_FILE);
+  let partial = dir.join("scrub.tmp.mp4");
+  let pass = Pass {
+    out: &partial,
+    size: sized(plan.cfg.output.size, SCRUB_WIDTH),
+    fps: SCRUB_FPS,
+    proxy: true,
+    boxes: false,
+    ranges: None,
+    dissolve: 0.0,
+    encoding: Encoding::Scrub,
+    chapters: false,
+  };
+  if let Err(e) = render_plan(dir, &plan, &pass, log, progress) {
+    let _ = fs::remove_file(&partial);
+    return Err(e);
+  }
+  fs::rename(&partial, &out).map_err(|e| format!("{}: {e}", out.display()))?;
+  fs::write(dir.join(SCRUB_STAMP), scrub_stamp(dir)).map_err(|e| e.to_string())?;
+  Ok(out)
+}
+
+/// The proxy for every segment, then the scrub file, each only when missing or stale.
+pub fn prepare(
+  dir: &Path,
+  log: &mut dyn FnMut(String),
+  progress: &mut dyn FnMut(u64, u64),
+) -> Result<PathBuf, String> {
+  let meta: Meta = read_json(&dir.join("meta.json"))?;
+  if !(0..meta.segments.len()).all(|i| dir.join(proxy_file(i)).is_file()) {
+    let p = make_proxy(dir)?;
+    log(format!("proxy: {}", p.display()));
+  }
+  if scrub_is_current(dir) {
+    return Ok(dir.join(SCRUB_FILE));
+  }
+  make_scrub(dir, log, progress)
 }
 
 fn summarize(timeline: &Timeline, duration: f64, events: usize, log: &mut dyn FnMut(String)) {
